@@ -3,8 +3,8 @@
 
 import PackageDescription
 
-let url = "https://gitlab.futo.org/videostreaming/fcast/-/jobs/91111/artifacts/raw/ios-bindings/fcast_sender_sdk.xcframework.zip"
-let checksum = "782316ae771fe82b72e373eb57431053e62e630fa2d53f6f997ed62b192e6e02"
+let url = "https://gitlab.futo.org/videostreaming/fcast/-/jobs/91137/artifacts/raw/ios-bindings/fcast_sender_sdk.xcframework.zip"
+let checksum = "e5a674c66554b71ce5893051a441575d91b9d2ddbaa5eb1401ba9f53b6acf759"
 
 let package = Package(
     name: "FCastSenderSDK",

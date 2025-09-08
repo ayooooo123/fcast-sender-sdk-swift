@@ -7,7 +7,7 @@ import Foundation
 // Depending on the consumer's build setup, the low-level FFI code
 // might be in a separate module, or it might be compiled inline into
 // this module. This is a bit of light hackery to work with both.
- #if canImport(fcast_sender_sdkFFI)
+#if canImport(fcast_sender_sdkFFI)
 import fcast_sender_sdkFFI
 #endif
 
@@ -489,6 +489,22 @@ fileprivate struct FfiConverterInt32: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
+    typealias FfiType = UInt64
+    typealias SwiftType = UInt64
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt64 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterDouble: FfiConverterPrimitive {
     typealias FfiType = Double
     typealias SwiftType = Double
@@ -758,7 +774,14 @@ public protocol CastingDeviceProtocol: AnyObject, Sendable {
     
     func disconnect() throws
     
-    func connect(appInfo: ApplicationInfo?, eventHandler: DeviceEventHandler) throws
+    /**
+     * Connect to the device.
+     *
+     * # Arguments
+     * * `reconnect_interval_millis`: the interval between each reconnect attempt. Setting this to `0`
+     * indicates that reconnects should not be attempted.
+     */
+    func connect(appInfo: ApplicationInfo?, eventHandler: DeviceEventHandler, reconnectIntervalMillis: UInt64) throws
     
     func getDeviceInfo()  -> DeviceInfo
     
@@ -939,10 +962,18 @@ open func disconnect()throws   {try rustCallWithError(FfiConverterTypeCastingDev
 }
 }
     
-open func connect(appInfo: ApplicationInfo?, eventHandler: DeviceEventHandler)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
+    /**
+     * Connect to the device.
+     *
+     * # Arguments
+     * * `reconnect_interval_millis`: the interval between each reconnect attempt. Setting this to `0`
+     * indicates that reconnects should not be attempted.
+     */
+open func connect(appInfo: ApplicationInfo?, eventHandler: DeviceEventHandler, reconnectIntervalMillis: UInt64)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
     uniffi_fcast_sender_sdk_fn_method_castingdevice_connect(self.uniffiCloneHandle(),
         FfiConverterOptionTypeApplicationInfo.lower(appInfo),
-        FfiConverterTypeDeviceEventHandler_lower(eventHandler),$0
+        FfiConverterTypeDeviceEventHandler_lower(eventHandler),
+        FfiConverterUInt64.lower(reconnectIntervalMillis),$0
     )
 }
 }
@@ -1054,7 +1085,7 @@ public protocol ChromecastDeviceProtocol: AnyObject, Sendable {
     
     func changeVolume(volume: Double) throws
     
-    func connect(appInfo: ApplicationInfo?, eventHandler: DeviceEventHandler) throws
+    func connect(appInfo: ApplicationInfo?, eventHandler: DeviceEventHandler, reconnectIntervalMillis: UInt64) throws
     
     func disconnect() throws
     
@@ -1166,10 +1197,11 @@ open func changeVolume(volume: Double)throws   {try rustCallWithError(FfiConvert
 }
 }
     
-open func connect(appInfo: ApplicationInfo?, eventHandler: DeviceEventHandler)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
+open func connect(appInfo: ApplicationInfo?, eventHandler: DeviceEventHandler, reconnectIntervalMillis: UInt64)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
     uniffi_fcast_sender_sdk_fn_method_chromecastdevice_connect(self.uniffiCloneHandle(),
         FfiConverterOptionTypeApplicationInfo.lower(appInfo),
-        FfiConverterTypeDeviceEventHandler_lower(eventHandler),$0
+        FfiConverterTypeDeviceEventHandler_lower(eventHandler),
+        FfiConverterUInt64.lower(reconnectIntervalMillis),$0
     )
 }
 }
@@ -2120,7 +2152,7 @@ public protocol FCastDeviceProtocol: AnyObject, Sendable {
     
     func changeVolume(volume: Double) throws
     
-    func connect(appInfo: ApplicationInfo?, eventHandler: DeviceEventHandler) throws
+    func connect(appInfo: ApplicationInfo?, eventHandler: DeviceEventHandler, reconnectIntervalMillis: UInt64) throws
     
     func disconnect() throws
     
@@ -2232,10 +2264,11 @@ open func changeVolume(volume: Double)throws   {try rustCallWithError(FfiConvert
 }
 }
     
-open func connect(appInfo: ApplicationInfo?, eventHandler: DeviceEventHandler)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
+open func connect(appInfo: ApplicationInfo?, eventHandler: DeviceEventHandler, reconnectIntervalMillis: UInt64)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
     uniffi_fcast_sender_sdk_fn_method_fcastdevice_connect(self.uniffiCloneHandle(),
         FfiConverterOptionTypeApplicationInfo.lower(appInfo),
-        FfiConverterTypeDeviceEventHandler_lower(eventHandler),$0
+        FfiConverterTypeDeviceEventHandler_lower(eventHandler),
+        FfiConverterUInt64.lower(reconnectIntervalMillis),$0
     )
 }
 }
@@ -3215,6 +3248,7 @@ public enum DeviceConnectionState {
     
     case disconnected
     case connecting
+    case reconnecting
     case connected(usedRemoteAddr: IpAddr, localAddr: IpAddr
     )
 }
@@ -3238,7 +3272,9 @@ public struct FfiConverterTypeDeviceConnectionState: FfiConverterRustBuffer {
         
         case 2: return .connecting
         
-        case 3: return .connected(usedRemoteAddr: try FfiConverterTypeIpAddr.read(from: &buf), localAddr: try FfiConverterTypeIpAddr.read(from: &buf)
+        case 3: return .reconnecting
+        
+        case 4: return .connected(usedRemoteAddr: try FfiConverterTypeIpAddr.read(from: &buf), localAddr: try FfiConverterTypeIpAddr.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -3257,8 +3293,12 @@ public struct FfiConverterTypeDeviceConnectionState: FfiConverterRustBuffer {
             writeInt(&buf, Int32(2))
         
         
-        case let .connected(usedRemoteAddr,localAddr):
+        case .reconnecting:
             writeInt(&buf, Int32(3))
+        
+        
+        case let .connected(usedRemoteAddr,localAddr):
+            writeInt(&buf, Int32(4))
             FfiConverterTypeIpAddr.write(usedRemoteAddr, into: &buf)
             FfiConverterTypeIpAddr.write(localAddr, into: &buf)
             
@@ -4578,7 +4618,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_disconnect() != 1946) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_connect() != 29089) {
+    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_connect() != 38396) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_get_device_info() != 2341) {
@@ -4611,7 +4651,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_change_volume() != 33973) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_connect() != 13692) {
+    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_connect() != 12899) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_disconnect() != 59227) {
@@ -4722,7 +4762,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_change_volume() != 36255) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_connect() != 51746) {
+    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_connect() != 55339) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_disconnect() != 21243) {
@@ -4811,7 +4851,6 @@ public func uniffiEnsureFcastSenderSdkInitialized() {
 }
 
 // swiftlint:enable all
-
 
 // import fcast_sender_sdk
 
