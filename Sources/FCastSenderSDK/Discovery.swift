@@ -1,16 +1,16 @@
 import Network
 
 public struct FoundDevice {
-    var name: String
-    var endpoint: NWEndpoint
-    var proto: ProtocolType
+    public var name: String
+    public var endpoint: NWEndpoint
+    public var proto: ProtocolType
 }
 
 public final class NWDeviceDiscoverer {
     private var fCastBrowser: NWBrowser
     private var chromecastBrowser: NWBrowser
 
-    init(
+    public init(
         onAdded: @escaping @Sendable (FoundDevice) -> Void,
         onRemoved: @escaping @Sendable (NWEndpoint) -> Void,
     ) {
