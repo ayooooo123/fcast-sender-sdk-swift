@@ -1,12 +1,12 @@
 import Network
 
-struct FoundDevice {
+public struct FoundDevice {
     var name: String
     var endpoint: NWEndpoint
     var proto: ProtocolType
 }
 
-final class NWDeviceDiscoverer {
+public final class NWDeviceDiscoverer {
     private var fCastBrowser: NWBrowser
     private var chromecastBrowser: NWBrowser
 
