@@ -1,6 +1,6 @@
 import Network
 
-public struct FoundDevice {
+public struct FoundDevice: Sendable {
     public var name: String
     public var endpoint: NWEndpoint
     public var proto: ProtocolType
