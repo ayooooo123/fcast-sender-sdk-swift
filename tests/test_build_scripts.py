@@ -11,6 +11,13 @@ VERIFY_SCRIPT = REPOSITORY_ROOT / "scripts" / "verify-artifact.sh"
 
 
 class BuildScriptTests(unittest.TestCase):
+    def test_build_preflights_lipo_before_starting_the_expensive_build(self):
+        text = BUILD_SCRIPT.read_text(encoding="utf-8")
+        self.assertRegex(
+            text,
+            r"for tool in [^\n]*\blipo\b[^\n]*; do",
+        )
+
     def test_scripts_are_strict_and_resolve_the_repository_root(self):
         for path in (BUILD_SCRIPT, VERIFY_SCRIPT):
             with self.subTest(path=path.name):

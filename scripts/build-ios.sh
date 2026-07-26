@@ -9,7 +9,7 @@ if [[ $# -ne 1 ]]; then
     exit 64
 fi
 
-for tool in git rustup cargo xcodebuild swift sw_vers python3 shasum; do
+for tool in git rustup cargo xcodebuild lipo swift sw_vers python3 shasum; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "required build tool is unavailable: $tool" >&2
         exit 69
