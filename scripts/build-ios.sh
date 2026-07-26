@@ -9,6 +9,8 @@ if [[ $# -ne 1 ]]; then
     exit 64
 fi
 
+python3 "$SCRIPT_DIR/build_boundary.py" check-environment
+
 for tool in git rustup cargo xcodebuild lipo swift sw_vers python3 shasum; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "required build tool is unavailable: $tool" >&2
@@ -70,33 +72,42 @@ if [[ "$ZIP_OUTPUT" != *"This is Zip $EXPECTED_ZIP_VERSION "* ]]; then
     exit 65
 fi
 
-DISTRIBUTION_OUTPUT="$(
-    python3 - "$REPOSITORY_ROOT" "$1" <<'PY'
-import sys
-from pathlib import Path
-
-root = Path(sys.argv[1]).resolve()
-requested = Path(sys.argv[2])
-if not requested.is_absolute():
-    requested = root / requested
-build_root = root / ".build"
-if build_root.is_symlink():
-    raise SystemExit("repo .build must not be a symlink")
-resolved_build = build_root.resolve()
-resolved_output = requested.resolve()
-if resolved_output == resolved_build or resolved_build not in resolved_output.parents:
-    raise SystemExit("distribution output must be a child of repo .build")
-current = build_root
-for component in resolved_output.relative_to(resolved_build).parts:
-    current = current / component
-    if current.is_symlink():
-        raise SystemExit(f"distribution output path must not contain symlinks: {current}")
-print(resolved_output)
-PY
-)"
-
 BUILD_TEMP="$(mktemp -d "${TMPDIR:-/tmp}/fcast-ios-distribution.XXXXXX")"
+BUILD_TEMP="$(cd "$BUILD_TEMP" && pwd -P)"
+CARGO_HOME="$BUILD_TEMP/cargo-home"
+CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=$BUILD_TEMP=/fcast-build"
+CFLAGS="-ffile-prefix-map=$BUILD_TEMP=/fcast-build -fdebug-prefix-map=$BUILD_TEMP=/fcast-build"
+export CARGO_HOME
+export CARGO_ENCODED_RUSTFLAGS
+export CFLAGS
+mkdir -p "$CARGO_HOME"
+
+OUTPUT_PREPARATION="$(
+    python3 "$SCRIPT_DIR/output_directory.py" prepare \
+        --root "$REPOSITORY_ROOT" \
+        --requested "$1"
+)"
+IFS=$'\t' read -r \
+    OUTPUT_FINAL_NAME OUTPUT_STAGING_NAME OUTPUT_BUILD_DEVICE \
+    OUTPUT_BUILD_INODE OUTPUT_STAGING_DEVICE OUTPUT_STAGING_INODE \
+    OUTPUT_FINAL_DEVICE OUTPUT_FINAL_INODE \
+    <<< "$OUTPUT_PREPARATION"
+DISTRIBUTION_OUTPUT="$REPOSITORY_ROOT/.build/$OUTPUT_STAGING_NAME"
+
+output_helper() {
+    python3 "$SCRIPT_DIR/output_directory.py" "$1" \
+        --root "$REPOSITORY_ROOT" \
+        --final-name "$OUTPUT_FINAL_NAME" \
+        --staging-name "$OUTPUT_STAGING_NAME" \
+        --build-device "$OUTPUT_BUILD_DEVICE" \
+        --build-inode "$OUTPUT_BUILD_INODE" \
+        --staging-device "$OUTPUT_STAGING_DEVICE" \
+        --staging-inode "$OUTPUT_STAGING_INODE" \
+        --final-device "$OUTPUT_FINAL_DEVICE" \
+        --final-inode "$OUTPUT_FINAL_INODE"
+}
 cleanup() {
+    output_helper discard || true
     rm -rf "$BUILD_TEMP"
 }
 trap cleanup EXIT
@@ -147,12 +158,6 @@ if [[ -n "$(git status --short --untracked-files=no)" ]]; then
     exit 66
 fi
 
-mkdir -p "$REPOSITORY_ROOT/.build"
-if [[ -e "$DISTRIBUTION_OUTPUT" ]]; then
-    rm -rf "$DISTRIBUTION_OUTPUT"
-fi
-mkdir -p "$DISTRIBUTION_OUTPUT"
-
 xcodebuild -create-xcframework \
         -library target/aarch64-apple-ios-sim/release/libfcast_sender_sdk.a \
         -headers ios-bindings/uniffi \
@@ -169,3 +174,4 @@ python3 "$REPOSITORY_ROOT/scripts/release_metadata.py" render-build-metadata \
     --output "$DISTRIBUTION_OUTPUT/build-metadata.json"
 
 "$REPOSITORY_ROOT/scripts/verify-artifact.sh" "$DISTRIBUTION_OUTPUT"
+output_helper publish

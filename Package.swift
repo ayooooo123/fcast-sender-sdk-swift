@@ -3,7 +3,7 @@
 import PackageDescription
 
 let url = "https://github.com/ayooooo123/fcast-sender-sdk-swift/releases/download/0.0.8-mediastorm.1/fcast_sender_sdk.xcframework.zip"
-let checksum = "e2cf3a46abc37abc855c9dc7c0a55c622f203117345bd586558891113cdae472"
+let checksum = "40968f03ef7e95acb178ea458be796cdf7c8b0e9ca0ffc4c262487176f6e9ed6"
 
 let package = Package(
     name: "FCastSenderSDK",

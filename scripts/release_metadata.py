@@ -1,6 +1,9 @@
 import argparse
 import json
+import os
 import re
+import secrets
+import stat
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -274,6 +277,81 @@ def serialize_json(payload: object) -> str:
     )
 
 
+def atomic_write_text(path, text):
+    output = Path(path)
+    if type(text) is not str:
+        raise ReleaseMetadataError("atomic writer input must be text")
+    parent = output.parent
+    name = output.name
+    if not name or name in (".", ".."):
+        raise ReleaseMetadataError("atomic writer output must name a file")
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        parent_fd = os.open(parent, flags)
+    except OSError as error:
+        raise ReleaseMetadataError(
+            f"output parent must be a real non-symlink directory: {error}"
+        ) from error
+    temporary_name = None
+    file_fd = None
+    try:
+        try:
+            existing = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None:
+            if stat.S_ISLNK(existing.st_mode):
+                raise ReleaseMetadataError(
+                    "atomic writer output must not be a symlink"
+                )
+            if not stat.S_ISREG(existing.st_mode):
+                raise ReleaseMetadataError(
+                    "atomic writer output must be a regular file"
+                )
+        for _ in range(128):
+            temporary_name = f".{name}.tmp-{secrets.token_hex(12)}"
+            try:
+                file_fd = os.open(
+                    temporary_name,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                    dir_fd=parent_fd,
+                )
+                break
+            except FileExistsError:
+                temporary_name = None
+        if file_fd is None:
+            raise ReleaseMetadataError(
+                "unable to allocate secure atomic-writer temporary file"
+            )
+        payload = text.encode("utf-8")
+        with os.fdopen(file_fd, "wb", closefd=True) as stream:
+            file_fd = None
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(
+            temporary_name,
+            name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        temporary_name = None
+        os.fsync(parent_fd)
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+        os.close(parent_fd)
+
+
 def render_build_inputs(source_pin, environment):
     _validate_source_pin(source_pin)
     _validate_environment(environment)
@@ -465,7 +543,7 @@ def main(argv=None):
     try:
         if arguments.command == "render-package":
             rendered = render_package(arguments.version, arguments.checksum)
-            Path(arguments.output).write_text(rendered, encoding="utf-8")
+            atomic_write_text(arguments.output, rendered)
         elif arguments.command == "build-inputs":
             source_pin = SourcePin.load(arguments.source_lock)
             environment = BuildEnvironment.load(arguments.environment_lock)
@@ -478,7 +556,7 @@ def main(argv=None):
                 environment,
                 arguments.source_date_epoch,
             )
-            Path(arguments.output).write_text(rendered, encoding="utf-8")
+            atomic_write_text(arguments.output, rendered)
     except (OSError, SourcePinError, ReleaseMetadataError) as error:
         print(f"release metadata error: {error}", file=sys.stderr)
         return 1

@@ -3,6 +3,9 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
+
+import scripts.release_metadata as release_metadata_module
 
 from scripts.release_metadata import (
     BuildEnvironment,
@@ -354,6 +357,56 @@ class ReleaseMetadataTests(unittest.TestCase):
             '}\n',
         )
         self.assertIn(b"caf\xc3\xa9", rendered.encode("utf-8"))
+
+    def test_atomic_writer_preserves_destination_and_cleans_temp_on_fsync_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "Package.swift"
+            output.write_text("old", encoding="utf-8")
+            with mock.patch(
+                "scripts.release_metadata.os.fsync",
+                side_effect=OSError("interrupted"),
+            ):
+                with self.assertRaisesRegex(OSError, "interrupted"):
+                    release_metadata_module.atomic_write_text(output, "new")
+            self.assertEqual(output.read_text(encoding="utf-8"), "old")
+            self.assertEqual(
+                [entry.name for entry in Path(directory).iterdir()],
+                ["Package.swift"],
+            )
+
+    def test_atomic_writer_preserves_destination_and_cleans_temp_on_replace_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "build-metadata.json"
+            output.write_text("old", encoding="utf-8")
+            with mock.patch(
+                "scripts.release_metadata.os.replace",
+                side_effect=OSError("replace failed"),
+            ):
+                with self.assertRaisesRegex(OSError, "replace failed"):
+                    release_metadata_module.atomic_write_text(output, "new")
+            self.assertEqual(output.read_text(encoding="utf-8"), "old")
+            self.assertEqual(
+                [entry.name for entry in Path(directory).iterdir()],
+                ["build-metadata.json"],
+            )
+
+    def test_atomic_writer_rejects_symlink_and_writes_exact_success_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            victim = parent / "victim"
+            victim.write_text("preserve", encoding="utf-8")
+            output = parent / "Package.swift"
+            output.symlink_to(victim)
+            with self.assertRaisesRegex(
+                ReleaseMetadataError,
+                "symlink",
+            ):
+                release_metadata_module.atomic_write_text(output, "attacker")
+            self.assertEqual(victim.read_text(encoding="utf-8"), "preserve")
+
+            output.unlink()
+            release_metadata_module.atomic_write_text(output, "café\n")
+            self.assertEqual(output.read_bytes(), "café\n".encode("utf-8"))
 
 
 if __name__ == "__main__":

@@ -1,7 +1,9 @@
 import argparse
 import json
+import os
 import plistlib
 import re
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -18,6 +20,15 @@ LIBRARY_NAME = "libfcast_sender_sdk.a"
 HEADER_NAME = "fcast_sender_sdkFFI.h"
 MODULE_MAP_NAME = "module.modulemap"
 MODULE_NAME = "fcast_sender_sdkFFI"
+CANONICAL_MODULE_MAP = (
+    b"module fcast_sender_sdkFFI {\n"
+    b"    header \"fcast_sender_sdkFFI.h\"\n"
+    b"    export *\n"
+    b"    use \"Darwin\"\n"
+    b"    use \"_Builtin_stdbool\"\n"
+    b"    use \"_Builtin_stdint\"\n"
+    b"}"
+)
 OUTPUT_NAMES = {
     FRAMEWORK_NAME,
     "FCastSenderSDK.swift",
@@ -43,19 +54,15 @@ def _reject_duplicate_object_keys(pairs):
     return parsed
 
 
-def _load_metadata(path):
+def _load_metadata(data):
     try:
         payload = json.loads(
-            path.read_text(encoding="utf-8"),
+            data.decode("utf-8"),
             object_pairs_hook=_reject_duplicate_object_keys,
         )
-    except json.JSONDecodeError as error:
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
         raise ArtifactVerificationError(
-            f"build metadata must be valid JSON: {error.msg}"
-        ) from error
-    except OSError as error:
-        raise ArtifactVerificationError(
-            f"unable to read build metadata: {error}"
+            f"build metadata must be valid UTF-8 JSON: {error}"
         ) from error
     if type(payload) is not dict:
         raise ArtifactVerificationError(
@@ -124,12 +131,51 @@ def _expected_metadata(source_pin, environment, source_date_epoch):
 
 
 def _read_bytes(path, label):
+    path = Path(path)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = None
     try:
-        if path.is_symlink():
-            raise ArtifactVerificationError(f"{label} must not be a symlink")
-        return path.read_bytes()
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise ArtifactVerificationError(
+                f"{label} must be a real non-symlink regular file"
+            )
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
     except OSError as error:
         raise ArtifactVerificationError(f"unable to read {label}: {error}") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _directory_names(path, label):
+    path = Path(path)
+    try:
+        if path.is_symlink() or not path.is_dir():
+            raise ArtifactVerificationError(
+                f"{label} must be a real non-symlink directory"
+            )
+        return {entry.name for entry in path.iterdir()}
+    except OSError as error:
+        raise ArtifactVerificationError(
+            f"unable to enumerate {label}: {error}"
+        ) from error
+
+
+def _require_directory_contents(path, expected, label):
+    actual = _directory_names(path, label)
+    if actual != set(expected):
+        raise ArtifactVerificationError(
+            f"{label} must have exact contents: "
+            + ", ".join(sorted(expected))
+        )
 
 
 def _reject_temp_path(data, label):
@@ -147,9 +193,8 @@ def _validate_library_entry(entry, expected, label):
             f"{label} AvailableLibraries entry must be a dictionary"
         )
     required = set(expected)
-    optional = {"BinaryPath"}
     missing = required - set(entry)
-    unknown = set(entry) - required - optional
+    unknown = set(entry) - required
     if missing or unknown:
         details = []
         if missing:
@@ -168,31 +213,12 @@ def _validate_library_entry(entry, expected, label):
             raise ArtifactVerificationError(
                 f"{label} {field} must be exactly {value}"
             )
-    if "BinaryPath" in entry and entry["BinaryPath"] != LIBRARY_NAME:
-        raise ArtifactVerificationError(
-            f"{label} BinaryPath must be exactly {LIBRARY_NAME}"
-        )
 
 
 def _validate_module_map(data):
-    try:
-        text = data.decode("utf-8")
-    except UnicodeDecodeError as error:
+    if data != CANONICAL_MODULE_MAP:
         raise ArtifactVerificationError(
-            "module map must be UTF-8 text"
-        ) from error
-    declarations = re.findall(r"(?m)^\s*module\s+([A-Za-z0-9_]+)\s*\{", text)
-    if declarations != [MODULE_NAME]:
-        raise ArtifactVerificationError(
-            f"module map must export exactly module {MODULE_NAME}"
-        )
-    if re.findall(r'(?m)^\s*header\s+"([^"]+)"\s*$', text) != [HEADER_NAME]:
-        raise ArtifactVerificationError(
-            f"module {MODULE_NAME} must reference exactly header {HEADER_NAME}"
-        )
-    if len(re.findall(r"(?m)^\s*export\s+\*\s*$", text)) != 1:
-        raise ArtifactVerificationError(
-            f"module {MODULE_NAME} must contain exactly one export *"
+            f"module map must equal the canonical module map for {MODULE_NAME}"
         )
 
 
@@ -218,11 +244,7 @@ def _validate_lipo(library):
 
 def verify_artifact(*, output, source_lock, environment_lock, tracked_swift):
     output = Path(output)
-    if output.is_symlink() or not output.is_dir():
-        raise ArtifactVerificationError(
-            "distribution output must be a real directory"
-        )
-    actual_names = {entry.name for entry in output.iterdir()}
+    actual_names = _directory_names(output, "distribution output")
     if actual_names != OUTPUT_NAMES:
         raise ArtifactVerificationError(
             "distribution output must contain only: "
@@ -238,7 +260,7 @@ def verify_artifact(*, output, source_lock, environment_lock, tracked_swift):
     metadata_path = output / "build-metadata.json"
     metadata_bytes = _read_bytes(metadata_path, "build metadata")
     _reject_temp_path(metadata_bytes, "build metadata")
-    metadata = _load_metadata(metadata_path)
+    metadata = _load_metadata(metadata_bytes)
     source_date_epoch = metadata.get("sourceDateEpoch")
     if type(source_date_epoch) is not int or source_date_epoch < 0:
         raise ArtifactVerificationError(
@@ -257,16 +279,39 @@ def verify_artifact(*, output, source_lock, environment_lock, tracked_swift):
         ) from error
 
     framework = output / FRAMEWORK_NAME
-    if framework.is_symlink() or not framework.is_dir():
-        raise ArtifactVerificationError("XCFramework must be a real directory")
+    _require_directory_contents(
+        framework,
+        {"Info.plist", "ios-arm64", "ios-arm64-simulator"},
+        "XCFramework root",
+    )
     plist_path = framework / "Info.plist"
+    plist_bytes = _read_bytes(plist_path, "XCFramework Info.plist")
+    _reject_temp_path(plist_bytes, "XCFramework Info.plist")
     try:
-        with plist_path.open("rb") as stream:
-            plist = plistlib.load(stream)
-    except (OSError, plistlib.InvalidFileException) as error:
+        plist = plistlib.loads(plist_bytes)
+    except plistlib.InvalidFileException as error:
         raise ArtifactVerificationError(
             f"unable to parse XCFramework Info.plist: {error}"
         ) from error
+    if type(plist) is not dict:
+        raise ArtifactVerificationError(
+            "XCFramework plist root must be a dictionary"
+        )
+    if set(plist) != {
+        "AvailableLibraries",
+        "CFBundlePackageType",
+        "XCFrameworkFormatVersion",
+    }:
+        raise ArtifactVerificationError(
+            "XCFramework plist must have the exact root keys"
+        )
+    if (
+        plist["CFBundlePackageType"] != "XFWK"
+        or plist["XCFrameworkFormatVersion"] != "1.0"
+    ):
+        raise ArtifactVerificationError(
+            "XCFramework plist must have exact package type XFWK and format 1.0"
+        )
     available = plist.get("AvailableLibraries")
     if type(available) is not list or len(available) != 2:
         raise ArtifactVerificationError(
@@ -274,6 +319,7 @@ def verify_artifact(*, output, source_lock, environment_lock, tracked_swift):
         )
 
     expected_device = {
+        "BinaryPath": LIBRARY_NAME,
         "LibraryIdentifier": "ios-arm64",
         "LibraryPath": LIBRARY_NAME,
         "HeadersPath": "Headers",
@@ -281,6 +327,7 @@ def verify_artifact(*, output, source_lock, environment_lock, tracked_swift):
         "SupportedPlatform": "ios",
     }
     expected_simulator = {
+        "BinaryPath": LIBRARY_NAME,
         "LibraryIdentifier": "ios-arm64-simulator",
         "LibraryPath": LIBRARY_NAME,
         "HeadersPath": "Headers",
@@ -321,25 +368,21 @@ def verify_artifact(*, output, source_lock, environment_lock, tracked_swift):
         slice_root = framework / identifier
         library = slice_root / LIBRARY_NAME
         headers = slice_root / "Headers"
-        if (
-            slice_root.is_symlink()
-            or library.is_symlink()
-            or headers.is_symlink()
-            or not library.is_file()
-            or not headers.is_dir()
-        ):
-            raise ArtifactVerificationError(
-                f"{identifier} must contain the exact library and Headers path"
-            )
-        if {entry.name for entry in headers.iterdir()} != {
-            HEADER_NAME,
-            MODULE_MAP_NAME,
-            "fcast_sender_sdk.swift",
-        }:
-            raise ArtifactVerificationError(
-                f"{identifier} Headers must contain the exact generated "
-                "header, module map, and Swift binding"
-            )
+        _require_directory_contents(
+            slice_root,
+            {LIBRARY_NAME, "Headers"},
+            f"{identifier} slice",
+        )
+        _require_directory_contents(
+            headers,
+            {
+                HEADER_NAME,
+                MODULE_MAP_NAME,
+                "fcast_sender_sdk.swift",
+            },
+            f"{identifier} Headers",
+        )
+        library_bytes = _read_bytes(library, f"{identifier} static library")
         header = _read_bytes(headers / HEADER_NAME, f"{identifier} header")
         module_map = _read_bytes(
             headers / MODULE_MAP_NAME,
@@ -349,6 +392,7 @@ def verify_artifact(*, output, source_lock, environment_lock, tracked_swift):
             headers / "fcast_sender_sdk.swift",
             f"{identifier} embedded Swift",
         )
+        _reject_temp_path(library_bytes, f"{identifier} static library")
         _reject_temp_path(header, f"{identifier} header")
         _reject_temp_path(module_map, f"{identifier} module map")
         _reject_temp_path(embedded_swift, f"{identifier} embedded Swift")
