@@ -192,6 +192,11 @@ def build_provenance(
             f"artifact URL must be exactly {expected_url}"
         )
     _validate_sha256(swiftpm_checksum, "SwiftPM checksum")
+    if archive_sha256 != swiftpm_checksum:
+        raise ReleaseMetadataError(
+            "archive SHA-256 and SwiftPM checksum must match exactly "
+            "for the ZIP binary target"
+        )
 
     return {
         "schemaVersion": 1,

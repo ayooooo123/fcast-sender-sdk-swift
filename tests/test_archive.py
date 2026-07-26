@@ -4,10 +4,12 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import warnings
 import zipfile
 from pathlib import Path
 from unittest import mock
 
+import scripts.archive as archive_module
 from scripts.archive import ArchiveError, create_archive
 
 
@@ -57,8 +59,24 @@ class ArchiveTests(unittest.TestCase):
                 infos = opened.infolist()
 
             names = [info.filename for info in infos]
-            self.assertEqual(names, sorted(names))
-            self.assertEqual(names[0], "fcast_sender_sdk.xcframework/")
+            self.assertEqual(
+                names,
+                [
+                    "fcast_sender_sdk.xcframework/",
+                    "fcast_sender_sdk.xcframework/Info.plist",
+                    "fcast_sender_sdk.xcframework/ios-arm64/",
+                    "fcast_sender_sdk.xcframework/ios-arm64/Headers/",
+                    (
+                        "fcast_sender_sdk.xcframework/ios-arm64/Headers/"
+                        "fcast_sender_sdkFFI.h"
+                    ),
+                    (
+                        "fcast_sender_sdk.xcframework/ios-arm64/Headers/"
+                        "module.modulemap"
+                    ),
+                ],
+            )
+            self.assertEqual(len(names), len(set(names)))
             self.assertTrue(
                 all(
                     name.startswith("fcast_sender_sdk.xcframework/")
@@ -140,6 +158,122 @@ class ArchiveTests(unittest.TestCase):
                             SOURCE_EPOCH,
                         )
 
+    def test_rejects_newline_in_file_and_directory_components(self):
+        for component_kind in ("file", "directory"):
+            with self.subTest(component_kind=component_kind):
+                with tempfile.TemporaryDirectory() as directory:
+                    framework = self.make_framework(directory)
+                    path = framework / "unsafe\nname"
+                    if component_kind == "directory":
+                        path.mkdir()
+                        (path / "nested").write_bytes(b"nested")
+                    else:
+                        path.write_bytes(b"unsafe")
+                    with self.assertRaisesRegex(
+                        ArchiveError,
+                        "newline or carriage return",
+                    ):
+                        create_archive(
+                            framework,
+                            Path(directory) / "newline.zip",
+                            SOURCE_EPOCH,
+                        )
+
+    def test_rejects_carriage_return_in_file_and_directory_components(self):
+        for component_kind in ("file", "directory"):
+            with self.subTest(component_kind=component_kind):
+                with tempfile.TemporaryDirectory() as directory:
+                    framework = self.make_framework(directory)
+                    path = framework / "unsafe\rname"
+                    if component_kind == "directory":
+                        path.mkdir()
+                        (path / "nested").write_bytes(b"nested")
+                    else:
+                        path.write_bytes(b"unsafe")
+                    with self.assertRaisesRegex(
+                        ArchiveError,
+                        "newline or carriage return",
+                    ):
+                        create_archive(
+                            framework,
+                            Path(directory) / "carriage-return.zip",
+                            SOURCE_EPOCH,
+                        )
+
+    def test_rejects_zip_with_missing_or_duplicate_submitted_entry(self):
+        real_run = subprocess.run
+
+        for discrepancy in ("missing", "duplicate"):
+            with self.subTest(discrepancy=discrepancy):
+                with tempfile.TemporaryDirectory() as directory:
+                    framework = self.make_framework(directory)
+                    archive = Path(directory) / f"{discrepancy}.zip"
+
+                    def tampered_zip(arguments, **keywords):
+                        submitted = keywords["input"].splitlines()
+                        if discrepancy == "missing":
+                            submitted.pop()
+                        result = real_run(
+                            arguments,
+                            **(keywords | {"input": "\n".join(submitted) + "\n"}),
+                        )
+                        if discrepancy == "duplicate":
+                            temporary_archive = Path(arguments[-2])
+                            with warnings.catch_warnings():
+                                warnings.simplefilter("ignore", UserWarning)
+                                with zipfile.ZipFile(
+                                    temporary_archive,
+                                    mode="a",
+                                ) as opened:
+                                    opened.writestr(
+                                        submitted[-1],
+                                        b"duplicate",
+                                    )
+                        return result
+
+                    with mock.patch(
+                        "scripts.archive.subprocess.run",
+                        side_effect=tampered_zip,
+                    ):
+                        with self.assertRaisesRegex(
+                            ArchiveError,
+                            "entries.*submitted",
+                        ):
+                            create_archive(framework, archive, SOURCE_EPOCH)
+                    self.assertFalse(archive.exists())
+
+    @unittest.skipUnless(
+        hasattr(os, "O_NOFOLLOW"),
+        "platform does not expose O_NOFOLLOW",
+    )
+    def test_rejects_regular_file_replaced_by_symlink_before_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            framework = self.make_framework(directory)
+            target = framework / "Info.plist"
+            outside = Path(directory) / "outside"
+            outside.write_bytes(b"must not be copied")
+            real_collect = archive_module._collect_entries
+
+            def collect_then_replace(source):
+                entries = real_collect(source)
+                target.unlink()
+                target.symlink_to(outside)
+                return entries
+
+            with mock.patch(
+                "scripts.archive._collect_entries",
+                side_effect=collect_then_replace,
+            ):
+                with self.assertRaisesRegex(
+                    ArchiveError,
+                    "copy regular file.*Info.plist",
+                ):
+                    create_archive(
+                        framework,
+                        Path(directory) / "nofollow.zip",
+                        SOURCE_EPOCH,
+                    )
+
     def test_zip_invocation_is_explicit_sorted_and_utc(self):
         with tempfile.TemporaryDirectory() as directory:
             framework = self.make_framework(directory)
@@ -157,7 +291,14 @@ class ArchiveTests(unittest.TestCase):
             self.assertEqual(arguments[0:3], ["/usr/bin/zip", "-X", "-q"])
             self.assertEqual(arguments[-1], "-@")
             self.assertNotIn("shell", keywords)
-            self.assertEqual(keywords["env"]["TZ"], "UTC")
+            self.assertEqual(
+                keywords["env"],
+                {
+                    "TZ": "UTC",
+                    "LC_ALL": "C",
+                    "LANG": "C",
+                },
+            )
             paths = keywords["input"].splitlines()
             self.assertEqual(paths, sorted(paths))
             self.assertTrue(
@@ -196,6 +337,46 @@ class ArchiveTests(unittest.TestCase):
                 hashes.append(result.stdout.strip())
 
             self.assertEqual(utc_archive.read_bytes(), honolulu_archive.read_bytes())
+            self.assertEqual(hashes[0], hashes[1])
+
+    def test_cli_ignores_hostile_zipopt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            framework = self.make_framework(directory)
+            baseline_archive = Path(directory) / "baseline.zip"
+            hostile_archive = Path(directory) / "hostile.zip"
+
+            hashes = []
+            for zipopt, output in (
+                (None, baseline_archive),
+                ("-0", hostile_archive),
+            ):
+                environment = os.environ.copy()
+                if zipopt is None:
+                    environment.pop("ZIPOPT", None)
+                else:
+                    environment["ZIPOPT"] = zipopt
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        str(ARCHIVE_SCRIPT),
+                        "--source",
+                        str(framework),
+                        "--output",
+                        str(output),
+                        "--source-epoch",
+                        str(SOURCE_EPOCH),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    env=environment,
+                )
+                hashes.append(result.stdout.strip())
+
+            self.assertEqual(
+                baseline_archive.read_bytes(),
+                hostile_archive.read_bytes(),
+            )
             self.assertEqual(hashes[0], hashes[1])
 
     def test_rejects_invalid_source_epoch(self):

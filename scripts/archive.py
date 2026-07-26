@@ -1,10 +1,10 @@
 import argparse
 import hashlib
 import os
-import shutil
 import stat
 import subprocess
 import tempfile
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -43,7 +43,7 @@ def create_archive(source: Path, output: Path, source_epoch: int) -> str:
             if kind == "directory":
                 staged_entry.mkdir(mode=0o755)
             else:
-                shutil.copyfile(source_entry, staged_entry)
+                _copy_regular_file(source_entry, staged_entry, relative)
                 os.chmod(staged_entry, 0o644)
 
         normalized_paths = [staged_root]
@@ -62,8 +62,11 @@ def create_archive(source: Path, output: Path, source_epoch: int) -> str:
         archive_entries.sort()
 
         temporary_archive = workspace / "archive.zip"
-        environment = os.environ.copy()
-        environment["TZ"] = "UTC"
+        environment = {
+            "TZ": "UTC",
+            "LC_ALL": "C",
+            "LANG": "C",
+        }
         try:
             subprocess.run(
                 [
@@ -84,6 +87,8 @@ def create_archive(source: Path, output: Path, source_epoch: int) -> str:
         except (OSError, subprocess.CalledProcessError) as error:
             detail = getattr(error, "stderr", None) or str(error)
             raise ArchiveError(f"unable to create normalized ZIP: {detail}") from error
+
+        _verify_archive_entries(temporary_archive, archive_entries)
 
         try:
             os.replace(temporary_archive, output_path)
@@ -138,6 +143,7 @@ def _collect_entries(source):
             ) from error
         for child in children:
             relative = relative_directory / child.name
+            _reject_control_characters(relative)
             _reject_host_metadata(relative)
             try:
                 child_stat = child.stat(follow_symlinks=False)
@@ -165,12 +171,80 @@ def _collect_entries(source):
     return collected
 
 
+def _reject_control_characters(relative):
+    if any(
+        "\n" in component or "\r" in component
+        for component in relative.parts
+    ):
+        raise ArchiveError(
+            "archive path components must not contain a newline or "
+            f"carriage return: {relative!r}"
+        )
+
+
 def _reject_host_metadata(relative):
     for part in relative.parts:
         if part in {".DS_Store", "__MACOSX"} or part.startswith("._"):
             raise ArchiveError(
                 f"archive source contains forbidden host metadata: {relative}"
             )
+
+
+def _copy_regular_file(source, destination, relative):
+    source_flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        source_flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        source_flags |= os.O_CLOEXEC
+
+    destination_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_CLOEXEC"):
+        destination_flags |= os.O_CLOEXEC
+
+    source_fd = None
+    destination_fd = None
+    try:
+        source_fd = os.open(source, source_flags)
+        source_stat = os.fstat(source_fd)
+        if not stat.S_ISREG(source_stat.st_mode):
+            raise ArchiveError(
+                f"archive source entry is no longer a regular file: {relative}"
+            )
+        destination_fd = os.open(destination, destination_flags, 0o644)
+        while True:
+            chunk = os.read(source_fd, 1024 * 1024)
+            if not chunk:
+                break
+            remaining = memoryview(chunk)
+            while remaining:
+                written = os.write(destination_fd, remaining)
+                if written == 0:
+                    raise OSError("zero-byte write while staging archive")
+                remaining = remaining[written:]
+    except OSError as error:
+        raise ArchiveError(
+            f"unable to copy regular file {relative}: {error}"
+        ) from error
+    finally:
+        if destination_fd is not None:
+            os.close(destination_fd)
+        if source_fd is not None:
+            os.close(source_fd)
+
+
+def _verify_archive_entries(archive, submitted_entries):
+    try:
+        with zipfile.ZipFile(archive) as opened:
+            actual_entries = opened.namelist()
+    except (OSError, zipfile.BadZipFile) as error:
+        raise ArchiveError(
+            f"unable to verify normalized ZIP entries: {error}"
+        ) from error
+    if actual_entries != submitted_entries:
+        raise ArchiveError(
+            "normalized ZIP entries do not exactly match the submitted "
+            "sorted entry list"
+        )
 
 
 def _sha256_file(path):

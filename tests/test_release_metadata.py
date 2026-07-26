@@ -21,7 +21,7 @@ SOURCE_LOCK = REPOSITORY_ROOT / "source.lock.json"
 BUILD_ENVIRONMENT_LOCK = REPOSITORY_ROOT / "build-environment.lock.json"
 VERSION = "0.0.8-mediastorm.1"
 CHECKSUM = "a" * 64
-ARCHIVE_SHA256 = "b" * 64
+ARCHIVE_SHA256 = CHECKSUM
 DISTRIBUTION_COMMIT = "c" * 40
 EXPECTED_URL = (
     "https://github.com/ayooooo123/fcast-sender-sdk-swift/releases/download/"
@@ -228,6 +228,23 @@ class ReleaseMetadataTests(unittest.TestCase):
                 arguments = defaults | changes
                 with self.assertRaisesRegex(ReleaseMetadataError, message):
                     build_provenance(**arguments)
+
+    def test_build_provenance_rejects_checksum_disagreement(self):
+        with self.assertRaisesRegex(
+            ReleaseMetadataError,
+            "archive SHA-256.*SwiftPM checksum.*match",
+        ):
+            build_provenance(
+                version=VERSION,
+                distribution_commit=DISTRIBUTION_COMMIT,
+                source_pin=self.source_pin,
+                environment=self.environment,
+                archive_sha256="b" * 64,
+                binary_target="fcast_sender_sdkFFI",
+                product="FCastSenderSDK",
+                artifact_url=EXPECTED_URL,
+                swiftpm_checksum=CHECKSUM,
+            )
 
     def test_validate_provenance_rejects_unknown_or_disagreeing_fields(self):
         provenance = self.make_provenance()
