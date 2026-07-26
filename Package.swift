@@ -1,10 +1,9 @@
 // swift-tools-version: 6.1
-// The swift-tools-version declares the minimum version of Swift required to build this package.
 
 import PackageDescription
 
-let url = "https://gitlab.futo.org/videostreaming/fcast/-/jobs/91137/artifacts/raw/ios-bindings/fcast_sender_sdk.xcframework.zip"
-let checksum = "e5a674c66554b71ce5893051a441575d91b9d2ddbaa5eb1401ba9f53b6acf759"
+let url = "https://github.com/ayooooo123/fcast-sender-sdk-swift/releases/download/0.0.8-mediastorm.1/fcast_sender_sdk.xcframework.zip"
+let checksum = "e2cf3a46abc37abc855c9dc7c0a55c622f203117345bd586558891113cdae472"
 
 let package = Package(
     name: "FCastSenderSDK",
@@ -12,10 +11,7 @@ let package = Package(
         .iOS(.v16)
     ],
     products: [
-        // Products define the executables and libraries a package produces, making them visible to other packages.
-        .library(
-            name: "FCastSenderSDK",
-            targets: ["FCastSenderSDK"]),
+        .library(name: "FCastSenderSDK", targets: ["FCastSenderSDK"])
     ],
     targets: [
         .binaryTarget(name: "fcast_sender_sdkFFI", url: url, checksum: checksum),

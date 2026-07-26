@@ -352,7 +352,7 @@ private func uniffiTraitInterfaceCallWithError<T, E>(
         callStatus.pointee.errorBuf = FfiConverterString.lower(String(describing: error))
     }
 }
-// Initial value and increment amount for handles.
+// Initial value and increment amount for handles. 
 // These ensure that SWIFT handles always have the lowest bit set
 fileprivate let UNIFFI_HANDLEMAP_INITIAL: UInt64 = 1
 fileprivate let UNIFFI_HANDLEMAP_DELTA: UInt64 = 2
@@ -505,6 +505,22 @@ fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterFloat: FfiConverterPrimitive {
+    typealias FfiType = Float
+    typealias SwiftType = Float
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Float {
+        return try lift(readFloat(&buf))
+    }
+
+    public static func write(_ value: Float, into buf: inout [UInt8]) {
+        writeFloat(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterDouble: FfiConverterPrimitive {
     typealias FfiType = Double
     typealias SwiftType = Double
@@ -557,7 +573,11 @@ fileprivate struct FfiConverterString: FfiConverter {
             return String()
         }
         let bytes = UnsafeBufferPointer<UInt8>(start: value.data!, count: Int(value.len))
-        return String(bytes: bytes, encoding: String.Encoding.utf8)!
+        // Use Swift's native UTF-8 decoder; `String(bytes:encoding:.utf8)` goes
+        // through Foundation's NSString and silently strips a leading U+FEFF BOM.
+        // Invalid UTF-8 substitutes U+FFFD instead of trapping (unreachable
+        // given Rust's `String` invariant).
+        return String(decoding: bytes, as: UTF8.self)
     }
 
     public static func lower(_ value: String) -> RustBuffer {
@@ -573,7 +593,8 @@ fileprivate struct FfiConverterString: FfiConverter {
 
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> String {
         let len: Int32 = try readInt(&buf)
-        return String(bytes: try readBytes(&buf, count: Int(len)), encoding: String.Encoding.utf8)!
+        // See `lift` above for why we avoid Foundation's NSString-backed decoder here.
+        return String(decoding: try readBytes(&buf, count: Int(len)), as: UTF8.self)
     }
 
     public static func write(_ value: String, into buf: inout [UInt8]) {
@@ -607,8 +628,6 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
 public protocol CastContextProtocol: AnyObject, Sendable {
     
     func createDeviceFromInfo(info: DeviceInfo)  -> CastingDevice
-    
-    func startFileServer()  -> FileServer
     
 }
 open class CastContext: CastContextProtocol, @unchecked Sendable {
@@ -660,6 +679,11 @@ public convenience init()throws  {
 }
 
     deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
         try! rustCall { uniffi_fcast_sender_sdk_fn_free_castcontext(handle, $0) }
     }
 
@@ -668,20 +692,15 @@ public convenience init()throws  {
     
 open func createDeviceFromInfo(info: DeviceInfo) -> CastingDevice  {
     return try!  FfiConverterTypeCastingDevice_lift(try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_castcontext_create_device_from_info(self.uniffiCloneHandle(),
+    uniffi_fcast_sender_sdk_fn_method_castcontext_create_device_from_info(
+            self.uniffiCloneHandle(),
         FfiConverterTypeDeviceInfo_lower(info),$0
     )
 })
 }
     
-open func startFileServer() -> FileServer  {
-    return try!  FfiConverterTypeFileServer_lift(try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_castcontext_start_file_server(self.uniffiCloneHandle(),$0
-    )
-})
-}
-    
 
+    
 }
 
 
@@ -711,7 +730,6 @@ public struct FfiConverterTypeCastContext: FfiConverter {
 }
 
 
-
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
@@ -738,27 +756,53 @@ public protocol CastingDeviceProtocol: AnyObject, Sendable {
     
     func castingProtocol()  -> ProtocolType
     
+    /**
+     * Returns `true` if the device has the required information needed to
+     * start a connection.
+     */
     func isReady()  -> Bool
     
+    /**
+     * Some features may only be present after the device has emitted the
+     * [`Connected`] event.
+     *
+     * [`Connected`]: DeviceConnectionState::Connected
+     */
     func supportsFeature(feature: DeviceFeature)  -> Bool
     
     func name()  -> String
     
-    func setName(name: String)
+    func setName(name: String) 
     
-    func seek(timeSeconds: Double) throws
+    func seek(timeSeconds: Double) throws 
     
-    func stopPlayback() throws
+    /**
+     * Stop the media that is playing on the receiver.
+     *
+     * This will usually result in the receiver closing the media viewer and show a default screen.
+     */
+    func stopPlayback() throws 
     
-    func pausePlayback() throws
+    func pausePlayback() throws 
     
-    func resumePlayback() throws
+    func resumePlayback() throws 
     
-    func load(request: LoadRequest) throws
+    /**
+     * Load a media item. `progress_update_interval_millis`, when set, is applied along with the
+     * load (see [`Self::set_progress_update_interval`]). `None` keeps the device's current
+     * interval.
+     */
+    func load(request: LoadRequest, progressUpdateIntervalMillis: UInt64?) throws 
     
-    func playlistItemNext() throws
+    /**
+     * Try to play the next item in the playlist.
+     */
+    func playlistItemNext() throws 
     
-    func playlistItemPrevious() throws
+    /**
+     * Try to play the previous item in the playlist.
+     */
+    func playlistItemPrevious() throws 
     
     /**
      * Set the item index for the currently playing playlist.
@@ -766,36 +810,74 @@ public protocol CastingDeviceProtocol: AnyObject, Sendable {
      * # Arguments
      * * `index`: zero-based index into the playlist
      */
-    func setPlaylistItemIndex(index: UInt32) throws
+    func setPlaylistItemIndex(index: UInt32) throws 
     
-    func changeVolume(volume: Double) throws
+    func changeVolume(volume: Double) throws 
     
-    func changeSpeed(speed: Double) throws
+    func changeSpeed(speed: Double) throws 
     
-    func disconnect() throws
+    func disconnect() throws 
     
     /**
      * Connect to the device.
      *
      * # Arguments
-     * * `reconnect_interval_millis`: the interval between each reconnect attempt. Setting this to `0`
-     * indicates that reconnects should not be attempted.
+     * * `reconnect_interval_millis`: the interval between each reconnect attempt. Setting this
+     * to `0` indicates that reconnects should not be attempted.
      */
-    func connect(appInfo: ApplicationInfo?, eventHandler: DeviceEventHandler, reconnectIntervalMillis: UInt64) throws
+    func connect(appInfo: ApplicationInfo?, eventHandler: DeviceEventHandler, reconnectIntervalMillis: UInt64) throws 
     
     func getDeviceInfo()  -> DeviceInfo
     
     func getAddresses()  -> [IpAddr]
     
-    func setAddresses(addrs: [IpAddr])
+    func setAddresses(addrs: [IpAddr]) 
     
     func getPort()  -> UInt16
     
-    func setPort(port: UInt16)
+    func setPort(port: UInt16) 
     
-    func subscribeEvent(group: GenericEventSubscriptionGroup) throws
+    func startMirroringSession(signaller: FwrtcSignaller) throws 
     
-    func unsubscribeEvent(group: GenericEventSubscriptionGroup) throws
+    func changeTrack(id: UInt32?, trackType: MediaTrackType) throws 
+    
+    func queueRemove(position: QueuePosition) throws 
+    
+    func queueAdd(item: QueueItem, position: QueuePosition) throws 
+    
+    func queueSelect(position: QueuePosition) throws 
+    
+    /**
+     * Load a queue of media items and begin playback.
+     *
+     * This is the rich, non-lossy counterpart to [`LoadRequest::Queue`](LoadRequest::Queue): it
+     * carries per-item titles, thumbnails, start times, volume/speed, the queue's `autoplay` flag,
+     * and per-entry `playback_duration`. FCast v4 only. Devices that don't support it return
+     * [`CastingDeviceError::UnsupportedFeature`].
+     */
+    func loadQueue(queue: Queue) throws 
+    
+    /**
+     * Insert a single item into the active queue at `position`, optionally bounding its playback
+     * to `playback_duration` seconds. FCast v4 only.
+     */
+    func queueInsert(item: MediaItem, playbackDuration: Double?, position: QueuePosition) throws 
+    
+    /**
+     * Add an external subtitle source to the current media. FCast v4 only.
+     */
+    func addSubtitleSource(subtitle: SubtitleSource) throws 
+    
+    /**
+     * Request how often the device reports playback progress
+     * ([`DeviceEventHandler::time_changed`]), in milliseconds.
+     *
+     * Can be set in any playback state and persists for the rest of the
+     * connection (a reconnect restores the device default). Values are
+     * floored to 100 ms. Supported on FCast v4 and Chromecast (see
+     * [`DeviceFeature::SetProgressUpdateInterval`]).
+     */
+    func setProgressUpdateInterval(intervalMillis: UInt64) throws 
     
 }
 /**
@@ -843,6 +925,11 @@ open class CastingDevice: CastingDeviceProtocol, @unchecked Sendable {
     // No primary constructor declared for this class.
 
     deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
         try! rustCall { uniffi_fcast_sender_sdk_fn_free_castingdevice(handle, $0) }
     }
 
@@ -851,21 +938,34 @@ open class CastingDevice: CastingDeviceProtocol, @unchecked Sendable {
     
 open func castingProtocol() -> ProtocolType  {
     return try!  FfiConverterTypeProtocolType_lift(try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_castingdevice_casting_protocol(self.uniffiCloneHandle(),$0
+    uniffi_fcast_sender_sdk_fn_method_castingdevice_casting_protocol(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
     
+    /**
+     * Returns `true` if the device has the required information needed to
+     * start a connection.
+     */
 open func isReady() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_castingdevice_is_ready(self.uniffiCloneHandle(),$0
+    uniffi_fcast_sender_sdk_fn_method_castingdevice_is_ready(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
     
+    /**
+     * Some features may only be present after the device has emitted the
+     * [`Connected`] event.
+     *
+     * [`Connected`]: DeviceConnectionState::Connected
+     */
 open func supportsFeature(feature: DeviceFeature) -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_castingdevice_supports_feature(self.uniffiCloneHandle(),
+    uniffi_fcast_sender_sdk_fn_method_castingdevice_supports_feature(
+            self.uniffiCloneHandle(),
         FfiConverterTypeDeviceFeature_lower(feature),$0
     )
 })
@@ -873,58 +973,84 @@ open func supportsFeature(feature: DeviceFeature) -> Bool  {
     
 open func name() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_castingdevice_name(self.uniffiCloneHandle(),$0
+    uniffi_fcast_sender_sdk_fn_method_castingdevice_name(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
     
 open func setName(name: String)  {try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_castingdevice_set_name(self.uniffiCloneHandle(),
+    uniffi_fcast_sender_sdk_fn_method_castingdevice_set_name(
+            self.uniffiCloneHandle(),
         FfiConverterString.lower(name),$0
     )
 }
 }
     
 open func seek(timeSeconds: Double)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_castingdevice_seek(self.uniffiCloneHandle(),
+    uniffi_fcast_sender_sdk_fn_method_castingdevice_seek(
+            self.uniffiCloneHandle(),
         FfiConverterDouble.lower(timeSeconds),$0
     )
 }
 }
     
+    /**
+     * Stop the media that is playing on the receiver.
+     *
+     * This will usually result in the receiver closing the media viewer and show a default screen.
+     */
 open func stopPlayback()throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_castingdevice_stop_playback(self.uniffiCloneHandle(),$0
+    uniffi_fcast_sender_sdk_fn_method_castingdevice_stop_playback(
+            self.uniffiCloneHandle(),$0
     )
 }
 }
     
 open func pausePlayback()throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_castingdevice_pause_playback(self.uniffiCloneHandle(),$0
+    uniffi_fcast_sender_sdk_fn_method_castingdevice_pause_playback(
+            self.uniffiCloneHandle(),$0
     )
 }
 }
     
 open func resumePlayback()throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_castingdevice_resume_playback(self.uniffiCloneHandle(),$0
+    uniffi_fcast_sender_sdk_fn_method_castingdevice_resume_playback(
+            self.uniffiCloneHandle(),$0
     )
 }
 }
     
-open func load(request: LoadRequest)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_castingdevice_load(self.uniffiCloneHandle(),
-        FfiConverterTypeLoadRequest_lower(request),$0
+    /**
+     * Load a media item. `progress_update_interval_millis`, when set, is applied along with the
+     * load (see [`Self::set_progress_update_interval`]). `None` keeps the device's current
+     * interval.
+     */
+open func load(request: LoadRequest, progressUpdateIntervalMillis: UInt64?)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
+    uniffi_fcast_sender_sdk_fn_method_castingdevice_load(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeLoadRequest_lower(request),
+        FfiConverterOptionUInt64.lower(progressUpdateIntervalMillis),$0
     )
 }
 }
     
+    /**
+     * Try to play the next item in the playlist.
+     */
 open func playlistItemNext()throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_castingdevice_playlist_item_next(self.uniffiCloneHandle(),$0
+    uniffi_fcast_sender_sdk_fn_method_castingdevice_playlist_item_next(
+            self.uniffiCloneHandle(),$0
     )
 }
 }
     
+    /**
+     * Try to play the previous item in the playlist.
+     */
 open func playlistItemPrevious()throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_castingdevice_playlist_item_previous(self.uniffiCloneHandle(),$0
+    uniffi_fcast_sender_sdk_fn_method_castingdevice_playlist_item_previous(
+            self.uniffiCloneHandle(),$0
     )
 }
 }
@@ -936,28 +1062,32 @@ open func playlistItemPrevious()throws   {try rustCallWithError(FfiConverterType
      * * `index`: zero-based index into the playlist
      */
 open func setPlaylistItemIndex(index: UInt32)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_castingdevice_set_playlist_item_index(self.uniffiCloneHandle(),
+    uniffi_fcast_sender_sdk_fn_method_castingdevice_set_playlist_item_index(
+            self.uniffiCloneHandle(),
         FfiConverterUInt32.lower(index),$0
     )
 }
 }
     
 open func changeVolume(volume: Double)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_castingdevice_change_volume(self.uniffiCloneHandle(),
+    uniffi_fcast_sender_sdk_fn_method_castingdevice_change_volume(
+            self.uniffiCloneHandle(),
         FfiConverterDouble.lower(volume),$0
     )
 }
 }
     
 open func changeSpeed(speed: Double)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_castingdevice_change_speed(self.uniffiCloneHandle(),
+    uniffi_fcast_sender_sdk_fn_method_castingdevice_change_speed(
+            self.uniffiCloneHandle(),
         FfiConverterDouble.lower(speed),$0
     )
 }
 }
     
 open func disconnect()throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_castingdevice_disconnect(self.uniffiCloneHandle(),$0
+    uniffi_fcast_sender_sdk_fn_method_castingdevice_disconnect(
+            self.uniffiCloneHandle(),$0
     )
 }
 }
@@ -966,11 +1096,12 @@ open func disconnect()throws   {try rustCallWithError(FfiConverterTypeCastingDev
      * Connect to the device.
      *
      * # Arguments
-     * * `reconnect_interval_millis`: the interval between each reconnect attempt. Setting this to `0`
-     * indicates that reconnects should not be attempted.
+     * * `reconnect_interval_millis`: the interval between each reconnect attempt. Setting this
+     * to `0` indicates that reconnects should not be attempted.
      */
 open func connect(appInfo: ApplicationInfo?, eventHandler: DeviceEventHandler, reconnectIntervalMillis: UInt64)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_castingdevice_connect(self.uniffiCloneHandle(),
+    uniffi_fcast_sender_sdk_fn_method_castingdevice_connect(
+            self.uniffiCloneHandle(),
         FfiConverterOptionTypeApplicationInfo.lower(appInfo),
         FfiConverterTypeDeviceEventHandler_lower(eventHandler),
         FfiConverterUInt64.lower(reconnectIntervalMillis),$0
@@ -980,20 +1111,23 @@ open func connect(appInfo: ApplicationInfo?, eventHandler: DeviceEventHandler, r
     
 open func getDeviceInfo() -> DeviceInfo  {
     return try!  FfiConverterTypeDeviceInfo_lift(try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_castingdevice_get_device_info(self.uniffiCloneHandle(),$0
+    uniffi_fcast_sender_sdk_fn_method_castingdevice_get_device_info(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
     
 open func getAddresses() -> [IpAddr]  {
     return try!  FfiConverterSequenceTypeIpAddr.lift(try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_castingdevice_get_addresses(self.uniffiCloneHandle(),$0
+    uniffi_fcast_sender_sdk_fn_method_castingdevice_get_addresses(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
     
 open func setAddresses(addrs: [IpAddr])  {try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_castingdevice_set_addresses(self.uniffiCloneHandle(),
+    uniffi_fcast_sender_sdk_fn_method_castingdevice_set_addresses(
+            self.uniffiCloneHandle(),
         FfiConverterSequenceTypeIpAddr.lower(addrs),$0
     )
 }
@@ -1001,33 +1135,122 @@ open func setAddresses(addrs: [IpAddr])  {try! rustCall() {
     
 open func getPort() -> UInt16  {
     return try!  FfiConverterUInt16.lift(try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_castingdevice_get_port(self.uniffiCloneHandle(),$0
+    uniffi_fcast_sender_sdk_fn_method_castingdevice_get_port(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
     
 open func setPort(port: UInt16)  {try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_castingdevice_set_port(self.uniffiCloneHandle(),
+    uniffi_fcast_sender_sdk_fn_method_castingdevice_set_port(
+            self.uniffiCloneHandle(),
         FfiConverterUInt16.lower(port),$0
     )
 }
 }
     
-open func subscribeEvent(group: GenericEventSubscriptionGroup)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_castingdevice_subscribe_event(self.uniffiCloneHandle(),
-        FfiConverterTypeGenericEventSubscriptionGroup_lower(group),$0
+open func startMirroringSession(signaller: FwrtcSignaller)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
+    uniffi_fcast_sender_sdk_fn_method_castingdevice_start_mirroring_session(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeFWRTCSignaller_lower(signaller),$0
     )
 }
 }
     
-open func unsubscribeEvent(group: GenericEventSubscriptionGroup)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_castingdevice_unsubscribe_event(self.uniffiCloneHandle(),
-        FfiConverterTypeGenericEventSubscriptionGroup_lower(group),$0
+open func changeTrack(id: UInt32?, trackType: MediaTrackType)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
+    uniffi_fcast_sender_sdk_fn_method_castingdevice_change_track(
+            self.uniffiCloneHandle(),
+        FfiConverterOptionUInt32.lower(id),
+        FfiConverterTypeMediaTrackType_lower(trackType),$0
+    )
+}
+}
+    
+open func queueRemove(position: QueuePosition)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
+    uniffi_fcast_sender_sdk_fn_method_castingdevice_queue_remove(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeQueuePosition_lower(position),$0
+    )
+}
+}
+    
+open func queueAdd(item: QueueItem, position: QueuePosition)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
+    uniffi_fcast_sender_sdk_fn_method_castingdevice_queue_add(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeQueueItem_lower(item),
+        FfiConverterTypeQueuePosition_lower(position),$0
+    )
+}
+}
+    
+open func queueSelect(position: QueuePosition)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
+    uniffi_fcast_sender_sdk_fn_method_castingdevice_queue_select(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeQueuePosition_lower(position),$0
+    )
+}
+}
+    
+    /**
+     * Load a queue of media items and begin playback.
+     *
+     * This is the rich, non-lossy counterpart to [`LoadRequest::Queue`](LoadRequest::Queue): it
+     * carries per-item titles, thumbnails, start times, volume/speed, the queue's `autoplay` flag,
+     * and per-entry `playback_duration`. FCast v4 only. Devices that don't support it return
+     * [`CastingDeviceError::UnsupportedFeature`].
+     */
+open func loadQueue(queue: Queue)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
+    uniffi_fcast_sender_sdk_fn_method_castingdevice_load_queue(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeQueue_lower(queue),$0
+    )
+}
+}
+    
+    /**
+     * Insert a single item into the active queue at `position`, optionally bounding its playback
+     * to `playback_duration` seconds. FCast v4 only.
+     */
+open func queueInsert(item: MediaItem, playbackDuration: Double?, position: QueuePosition)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
+    uniffi_fcast_sender_sdk_fn_method_castingdevice_queue_insert(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeMediaItem_lower(item),
+        FfiConverterOptionDouble.lower(playbackDuration),
+        FfiConverterTypeQueuePosition_lower(position),$0
+    )
+}
+}
+    
+    /**
+     * Add an external subtitle source to the current media. FCast v4 only.
+     */
+open func addSubtitleSource(subtitle: SubtitleSource)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
+    uniffi_fcast_sender_sdk_fn_method_castingdevice_add_subtitle_source(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeSubtitleSource_lower(subtitle),$0
+    )
+}
+}
+    
+    /**
+     * Request how often the device reports playback progress
+     * ([`DeviceEventHandler::time_changed`]), in milliseconds.
+     *
+     * Can be set in any playback state and persists for the rest of the
+     * connection (a reconnect restores the device default). Values are
+     * floored to 100 ms. Supported on FCast v4 and Chromecast (see
+     * [`DeviceFeature::SetProgressUpdateInterval`]).
+     */
+open func setProgressUpdateInterval(intervalMillis: UInt64)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
+    uniffi_fcast_sender_sdk_fn_method_castingdevice_set_progress_update_interval(
+            self.uniffiCloneHandle(),
+        FfiConverterUInt64.lower(intervalMillis),$0
     )
 }
 }
     
 
+    
 }
 
 
@@ -1057,7 +1280,6 @@ public struct FfiConverterTypeCastingDevice: FfiConverter {
 }
 
 
-
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
@@ -1079,15 +1301,19 @@ public func FfiConverterTypeCastingDevice_lower(_ value: CastingDevice) -> UInt6
 
 public protocol ChromecastDeviceProtocol: AnyObject, Sendable {
     
+    func addSubtitleSource(subtitle: SubtitleSource) throws 
+    
     func castingProtocol()  -> ProtocolType
     
-    func changeSpeed(speed: Double) throws
+    func changeSpeed(speed: Double) throws 
     
-    func changeVolume(volume: Double) throws
+    func changeTrack(id: UInt32?, trackType: MediaTrackType) throws 
     
-    func connect(appInfo: ApplicationInfo?, eventHandler: DeviceEventHandler, reconnectIntervalMillis: UInt64) throws
+    func changeVolume(volume: Double) throws 
     
-    func disconnect() throws
+    func connect(appInfo: ApplicationInfo?, eventHandler: DeviceEventHandler, reconnectIntervalMillis: UInt64) throws 
+    
+    func disconnect() throws 
     
     func getAddresses()  -> [IpAddr]
     
@@ -1097,35 +1323,45 @@ public protocol ChromecastDeviceProtocol: AnyObject, Sendable {
     
     func isReady()  -> Bool
     
-    func load(request: LoadRequest) throws
+    func load(request: LoadRequest, progressUpdateIntervalMillis: UInt64?) throws 
+    
+    func loadQueue(queue: Queue) throws 
     
     func name()  -> String
     
-    func pausePlayback() throws
+    func pausePlayback() throws 
     
-    func playlistItemNext() throws
+    func playlistItemNext() throws 
     
-    func playlistItemPrevious() throws
+    func playlistItemPrevious() throws 
     
-    func resumePlayback() throws
+    func queueAdd(item: QueueItem, position: QueuePosition) throws 
     
-    func seek(timeSeconds: Double) throws
+    func queueInsert(item: MediaItem, playbackDuration: Double?, position: QueuePosition) throws 
     
-    func setAddresses(addrs: [IpAddr])
+    func queueRemove(position: QueuePosition) throws 
     
-    func setName(name: String)
+    func queueSelect(position: QueuePosition) throws 
     
-    func setPlaylistItemIndex(index: UInt32) throws
+    func resumePlayback() throws 
     
-    func setPort(port: UInt16)
+    func seek(timeSeconds: Double) throws 
     
-    func stopPlayback() throws
+    func setAddresses(addrs: [IpAddr]) 
     
-    func subscribeEvent(group: GenericEventSubscriptionGroup) throws
+    func setName(name: String) 
+    
+    func setPlaylistItemIndex(index: UInt32) throws 
+    
+    func setPort(port: UInt16) 
+    
+    func setProgressUpdateInterval(intervalMillis: UInt64) throws 
+    
+    func startMirroringSession(sig: FwrtcSignaller) throws 
+    
+    func stopPlayback() throws 
     
     func supportsFeature(feature: DeviceFeature)  -> Bool
-    
-    func unsubscribeEvent(group: GenericEventSubscriptionGroup) throws
     
 }
 open class ChromecastDevice: ChromecastDeviceProtocol, @unchecked Sendable {
@@ -1170,35 +1406,61 @@ open class ChromecastDevice: ChromecastDeviceProtocol, @unchecked Sendable {
     // No primary constructor declared for this class.
 
     deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
         try! rustCall { uniffi_fcast_sender_sdk_fn_free_chromecastdevice(handle, $0) }
     }
 
     
 
     
+open func addSubtitleSource(subtitle: SubtitleSource)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
+    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_add_subtitle_source(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeSubtitleSource_lower(subtitle),$0
+    )
+}
+}
+    
 open func castingProtocol() -> ProtocolType  {
     return try!  FfiConverterTypeProtocolType_lift(try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_casting_protocol(self.uniffiCloneHandle(),$0
+    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_casting_protocol(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
     
 open func changeSpeed(speed: Double)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_change_speed(self.uniffiCloneHandle(),
+    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_change_speed(
+            self.uniffiCloneHandle(),
         FfiConverterDouble.lower(speed),$0
     )
 }
 }
     
+open func changeTrack(id: UInt32?, trackType: MediaTrackType)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
+    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_change_track(
+            self.uniffiCloneHandle(),
+        FfiConverterOptionUInt32.lower(id),
+        FfiConverterTypeMediaTrackType_lower(trackType),$0
+    )
+}
+}
+    
 open func changeVolume(volume: Double)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_change_volume(self.uniffiCloneHandle(),
+    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_change_volume(
+            self.uniffiCloneHandle(),
         FfiConverterDouble.lower(volume),$0
     )
 }
 }
     
 open func connect(appInfo: ApplicationInfo?, eventHandler: DeviceEventHandler, reconnectIntervalMillis: UInt64)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_connect(self.uniffiCloneHandle(),
+    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_connect(
+            self.uniffiCloneHandle(),
         FfiConverterOptionTypeApplicationInfo.lower(appInfo),
         FfiConverterTypeDeviceEventHandler_lower(eventHandler),
         FfiConverterUInt64.lower(reconnectIntervalMillis),$0
@@ -1207,141 +1469,206 @@ open func connect(appInfo: ApplicationInfo?, eventHandler: DeviceEventHandler, r
 }
     
 open func disconnect()throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_disconnect(self.uniffiCloneHandle(),$0
+    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_disconnect(
+            self.uniffiCloneHandle(),$0
     )
 }
 }
     
 open func getAddresses() -> [IpAddr]  {
     return try!  FfiConverterSequenceTypeIpAddr.lift(try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_get_addresses(self.uniffiCloneHandle(),$0
+    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_get_addresses(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
     
 open func getDeviceInfo() -> DeviceInfo  {
     return try!  FfiConverterTypeDeviceInfo_lift(try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_get_device_info(self.uniffiCloneHandle(),$0
+    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_get_device_info(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
     
 open func getPort() -> UInt16  {
     return try!  FfiConverterUInt16.lift(try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_get_port(self.uniffiCloneHandle(),$0
+    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_get_port(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
     
 open func isReady() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_is_ready(self.uniffiCloneHandle(),$0
+    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_is_ready(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
     
-open func load(request: LoadRequest)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_load(self.uniffiCloneHandle(),
-        FfiConverterTypeLoadRequest_lower(request),$0
+open func load(request: LoadRequest, progressUpdateIntervalMillis: UInt64?)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
+    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_load(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeLoadRequest_lower(request),
+        FfiConverterOptionUInt64.lower(progressUpdateIntervalMillis),$0
+    )
+}
+}
+    
+open func loadQueue(queue: Queue)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
+    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_load_queue(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeQueue_lower(queue),$0
     )
 }
 }
     
 open func name() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_name(self.uniffiCloneHandle(),$0
+    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_name(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
     
 open func pausePlayback()throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_pause_playback(self.uniffiCloneHandle(),$0
+    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_pause_playback(
+            self.uniffiCloneHandle(),$0
     )
 }
 }
     
 open func playlistItemNext()throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_playlist_item_next(self.uniffiCloneHandle(),$0
+    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_playlist_item_next(
+            self.uniffiCloneHandle(),$0
     )
 }
 }
     
 open func playlistItemPrevious()throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_playlist_item_previous(self.uniffiCloneHandle(),$0
+    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_playlist_item_previous(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+open func queueAdd(item: QueueItem, position: QueuePosition)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
+    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_queue_add(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeQueueItem_lower(item),
+        FfiConverterTypeQueuePosition_lower(position),$0
+    )
+}
+}
+    
+open func queueInsert(item: MediaItem, playbackDuration: Double?, position: QueuePosition)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
+    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_queue_insert(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeMediaItem_lower(item),
+        FfiConverterOptionDouble.lower(playbackDuration),
+        FfiConverterTypeQueuePosition_lower(position),$0
+    )
+}
+}
+    
+open func queueRemove(position: QueuePosition)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
+    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_queue_remove(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeQueuePosition_lower(position),$0
+    )
+}
+}
+    
+open func queueSelect(position: QueuePosition)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
+    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_queue_select(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeQueuePosition_lower(position),$0
     )
 }
 }
     
 open func resumePlayback()throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_resume_playback(self.uniffiCloneHandle(),$0
+    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_resume_playback(
+            self.uniffiCloneHandle(),$0
     )
 }
 }
     
 open func seek(timeSeconds: Double)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_seek(self.uniffiCloneHandle(),
+    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_seek(
+            self.uniffiCloneHandle(),
         FfiConverterDouble.lower(timeSeconds),$0
     )
 }
 }
     
 open func setAddresses(addrs: [IpAddr])  {try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_set_addresses(self.uniffiCloneHandle(),
+    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_set_addresses(
+            self.uniffiCloneHandle(),
         FfiConverterSequenceTypeIpAddr.lower(addrs),$0
     )
 }
 }
     
 open func setName(name: String)  {try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_set_name(self.uniffiCloneHandle(),
+    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_set_name(
+            self.uniffiCloneHandle(),
         FfiConverterString.lower(name),$0
     )
 }
 }
     
 open func setPlaylistItemIndex(index: UInt32)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_set_playlist_item_index(self.uniffiCloneHandle(),
+    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_set_playlist_item_index(
+            self.uniffiCloneHandle(),
         FfiConverterUInt32.lower(index),$0
     )
 }
 }
     
 open func setPort(port: UInt16)  {try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_set_port(self.uniffiCloneHandle(),
+    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_set_port(
+            self.uniffiCloneHandle(),
         FfiConverterUInt16.lower(port),$0
     )
 }
 }
     
-open func stopPlayback()throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_stop_playback(self.uniffiCloneHandle(),$0
+open func setProgressUpdateInterval(intervalMillis: UInt64)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
+    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_set_progress_update_interval(
+            self.uniffiCloneHandle(),
+        FfiConverterUInt64.lower(intervalMillis),$0
     )
 }
 }
     
-open func subscribeEvent(group: GenericEventSubscriptionGroup)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_subscribe_event(self.uniffiCloneHandle(),
-        FfiConverterTypeGenericEventSubscriptionGroup_lower(group),$0
+open func startMirroringSession(sig: FwrtcSignaller)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
+    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_start_mirroring_session(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeFWRTCSignaller_lower(sig),$0
+    )
+}
+}
+    
+open func stopPlayback()throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
+    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_stop_playback(
+            self.uniffiCloneHandle(),$0
     )
 }
 }
     
 open func supportsFeature(feature: DeviceFeature) -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_supports_feature(self.uniffiCloneHandle(),
+    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_supports_feature(
+            self.uniffiCloneHandle(),
         FfiConverterTypeDeviceFeature_lower(feature),$0
     )
 })
 }
     
-open func unsubscribeEvent(group: GenericEventSubscriptionGroup)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_chromecastdevice_unsubscribe_event(self.uniffiCloneHandle(),
-        FfiConverterTypeGenericEventSubscriptionGroup_lower(group),$0
-    )
-}
-}
-    
 
+    
 }
 
 
@@ -1373,7 +1700,6 @@ extension ChromecastDevice: CastingDeviceProtocol {}
 
 
 
-
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
@@ -1401,19 +1727,20 @@ public protocol DeviceDiscovererEventHandler: AnyObject, Sendable {
     /**
      * Called when a device is found.
      */
-    func deviceAvailable(deviceInfo: DeviceInfo)
+    func deviceAvailable(deviceInfo: DeviceInfo) 
     
     /**
      * Called when a device is removed or lost.
      */
-    func deviceRemoved(deviceName: String)
+    func deviceRemoved(deviceName: String) 
     
     /**
      * Called when a device has changed.
      *
-     * The `name` field of `device_info` will correspond to a device announced from `device_available`.
+     * The `name` field of `device_info` will correspond to a device announced
+     * from `device_available`.
      */
-    func deviceChanged(deviceInfo: DeviceInfo)
+    func deviceChanged(deviceInfo: DeviceInfo) 
     
 }
 /**
@@ -1461,6 +1788,11 @@ open class DeviceDiscovererEventHandlerImpl: DeviceDiscovererEventHandler, @unch
     // No primary constructor declared for this class.
 
     deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
         try! rustCall { uniffi_fcast_sender_sdk_fn_free_devicediscoverereventhandler(handle, $0) }
     }
 
@@ -1471,7 +1803,8 @@ open class DeviceDiscovererEventHandlerImpl: DeviceDiscovererEventHandler, @unch
      * Called when a device is found.
      */
 open func deviceAvailable(deviceInfo: DeviceInfo)  {try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_devicediscoverereventhandler_device_available(self.uniffiCloneHandle(),
+    uniffi_fcast_sender_sdk_fn_method_devicediscoverereventhandler_device_available(
+            self.uniffiCloneHandle(),
         FfiConverterTypeDeviceInfo_lower(deviceInfo),$0
     )
 }
@@ -1481,7 +1814,8 @@ open func deviceAvailable(deviceInfo: DeviceInfo)  {try! rustCall() {
      * Called when a device is removed or lost.
      */
 open func deviceRemoved(deviceName: String)  {try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_devicediscoverereventhandler_device_removed(self.uniffiCloneHandle(),
+    uniffi_fcast_sender_sdk_fn_method_devicediscoverereventhandler_device_removed(
+            self.uniffiCloneHandle(),
         FfiConverterString.lower(deviceName),$0
     )
 }
@@ -1490,16 +1824,19 @@ open func deviceRemoved(deviceName: String)  {try! rustCall() {
     /**
      * Called when a device has changed.
      *
-     * The `name` field of `device_info` will correspond to a device announced from `device_available`.
+     * The `name` field of `device_info` will correspond to a device announced
+     * from `device_available`.
      */
 open func deviceChanged(deviceInfo: DeviceInfo)  {try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_devicediscoverereventhandler_device_changed(self.uniffiCloneHandle(),
+    uniffi_fcast_sender_sdk_fn_method_devicediscoverereventhandler_device_changed(
+            self.uniffiCloneHandle(),
         FfiConverterTypeDeviceInfo_lower(deviceInfo),$0
     )
 }
 }
     
 
+    
 }
 
 
@@ -1510,9 +1847,8 @@ fileprivate struct UniffiCallbackInterfaceDeviceDiscovererEventHandler {
     // Create the VTable using a series of closures.
     // Swift automatically converts these into C callback functions.
     //
-    // This creates 1-element array, since this seems to be the only way to construct a const
-    // pointer that we can pass to the Rust code.
-    static let vtable: [UniffiVTableCallbackInterfaceDeviceDiscovererEventHandler] = [UniffiVTableCallbackInterfaceDeviceDiscovererEventHandler(
+    // Store the vtable directly.
+    static let vtable: UniffiVTableCallbackInterfaceDeviceDiscovererEventHandler = UniffiVTableCallbackInterfaceDeviceDiscovererEventHandler(
         uniffiFree: { (uniffiHandle: UInt64) -> () in
             do {
                 try FfiConverterTypeDeviceDiscovererEventHandler.handleMap.remove(handle: uniffiHandle)
@@ -1599,11 +1935,23 @@ fileprivate struct UniffiCallbackInterfaceDeviceDiscovererEventHandler {
                 writeReturn: writeReturn
             )
         }
-    )]
+    )
+
+    // Rust stores this pointer for future callback invocations, so it must live
+    // for the process lifetime (not just for the init function call).
+    //
+    // `nonisolated(unsafe)` is needed under Swift 6 strict concurrency.
+    // This is safe because the pointee is initialized once during static init
+    // and never mutated by either side of the FFI.  Its fields are C function pointers.
+    nonisolated(unsafe) static let vtablePtr: UnsafePointer<UniffiVTableCallbackInterfaceDeviceDiscovererEventHandler> = {
+        let ptr = UnsafeMutablePointer<UniffiVTableCallbackInterfaceDeviceDiscovererEventHandler>.allocate(capacity: 1)
+        ptr.initialize(to: vtable)
+        return UnsafePointer(ptr)
+    }()
 }
 
 private func uniffiCallbackInitDeviceDiscovererEventHandler() {
-    uniffi_fcast_sender_sdk_fn_init_callback_vtable_devicediscoverereventhandler(UniffiCallbackInterfaceDeviceDiscovererEventHandler.vtable)
+    uniffi_fcast_sender_sdk_fn_init_callback_vtable_devicediscoverereventhandler(UniffiCallbackInterfaceDeviceDiscovererEventHandler.vtablePtr)
 }
 
 #if swift(>=5.8)
@@ -1647,7 +1995,6 @@ public struct FfiConverterTypeDeviceDiscovererEventHandler: FfiConverter {
 }
 
 
-
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
@@ -1669,25 +2016,62 @@ public func FfiConverterTypeDeviceDiscovererEventHandler_lower(_ value: DeviceDi
 
 public protocol DeviceEventHandler: AnyObject, Sendable {
     
-    func connectionStateChanged(state: DeviceConnectionState)
+    func connectionStateChanged(state: DeviceConnectionState) 
     
-    func volumeChanged(volume: Double)
+    func volumeChanged(volume: Double) 
     
-    func timeChanged(time: Double)
+    func timeChanged(time: Double) 
     
-    func playbackStateChanged(state: PlaybackState)
+    func playbackStateChanged(state: PlaybackState) 
     
-    func durationChanged(duration: Double)
+    func durationChanged(duration: Double) 
     
-    func speedChanged(speed: Double)
+    func speedChanged(speed: Double) 
     
-    func sourceChanged(source: Source)
+    func sourceChanged(source: Source) 
     
-    func keyEvent(event: GenericKeyEvent)
+    /**
+     * Called when the current media item's playback is **stopped**, that is,
+     * explicitly terminated before reaching its natural end, either because a
+     * stop was requested (e.g. via [`CastingDevice::stop_playback`]).
+     *
+     * This is deliberately distinct from playback *ending*. A media item that
+     * plays through to completion is reported as [`PlaybackState::Ended`] via
+     * [`DeviceEventHandler::playback_state_changed`].
+     */
+    func playbackStopped() 
     
-    func mediaEvent(event: GenericMediaEvent)
+    func playbackError(message: String) 
     
-    func playbackError(message: String)
+    func tracksAvailable(tracks: [MediaTrack]) 
+    
+    func trackSelected(id: UInt32?, typ: MediaTrackType) 
+    
+    /**
+     * The available tracks and/or the current per-type selection changed.
+     *
+     * Carries the full track list plus the selected id for each track type in one coherent
+     * snapshot, aggregating what the finer-grained [`tracks_available`](Self::tracks_available) and
+     * [`track_selected`](Self::track_selected) callbacks report separately. Prefer this for
+     * driving UI. FCast v4 only.
+     */
+    func tracksChanged(tracks: TrackList) 
+    
+    /**
+     * The receiver's queue changed.
+     *
+     * Fires on the initial queue load, on an insertion or removal, and on a selection change,
+     * regardless of whether this sender or another connected sender caused it. Carries the full
+     * current queue. When the queue ends (playback stops or a single-item load replaces it) one
+     * final empty snapshot is delivered. FCast v4 only.
+     */
+    func queueChanged(queue: QueueState) 
+    
+    /**
+     * The receiver rejected a command this sender issued (e.g. a queue mutation that was out of
+     * range, targeted the playing item, or hit the queue size cap). FCast v4 only.
+     */
+    func commandError(error: ReceiverError) 
     
 }
 open class DeviceEventHandlerImpl: DeviceEventHandler, @unchecked Sendable {
@@ -1732,6 +2116,11 @@ open class DeviceEventHandlerImpl: DeviceEventHandler, @unchecked Sendable {
     // No primary constructor declared for this class.
 
     deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
         try! rustCall { uniffi_fcast_sender_sdk_fn_free_deviceeventhandler(handle, $0) }
     }
 
@@ -1739,76 +2128,148 @@ open class DeviceEventHandlerImpl: DeviceEventHandler, @unchecked Sendable {
 
     
 open func connectionStateChanged(state: DeviceConnectionState)  {try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_deviceeventhandler_connection_state_changed(self.uniffiCloneHandle(),
+    uniffi_fcast_sender_sdk_fn_method_deviceeventhandler_connection_state_changed(
+            self.uniffiCloneHandle(),
         FfiConverterTypeDeviceConnectionState_lower(state),$0
     )
 }
 }
     
 open func volumeChanged(volume: Double)  {try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_deviceeventhandler_volume_changed(self.uniffiCloneHandle(),
+    uniffi_fcast_sender_sdk_fn_method_deviceeventhandler_volume_changed(
+            self.uniffiCloneHandle(),
         FfiConverterDouble.lower(volume),$0
     )
 }
 }
     
 open func timeChanged(time: Double)  {try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_deviceeventhandler_time_changed(self.uniffiCloneHandle(),
+    uniffi_fcast_sender_sdk_fn_method_deviceeventhandler_time_changed(
+            self.uniffiCloneHandle(),
         FfiConverterDouble.lower(time),$0
     )
 }
 }
     
 open func playbackStateChanged(state: PlaybackState)  {try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_deviceeventhandler_playback_state_changed(self.uniffiCloneHandle(),
+    uniffi_fcast_sender_sdk_fn_method_deviceeventhandler_playback_state_changed(
+            self.uniffiCloneHandle(),
         FfiConverterTypePlaybackState_lower(state),$0
     )
 }
 }
     
 open func durationChanged(duration: Double)  {try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_deviceeventhandler_duration_changed(self.uniffiCloneHandle(),
+    uniffi_fcast_sender_sdk_fn_method_deviceeventhandler_duration_changed(
+            self.uniffiCloneHandle(),
         FfiConverterDouble.lower(duration),$0
     )
 }
 }
     
 open func speedChanged(speed: Double)  {try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_deviceeventhandler_speed_changed(self.uniffiCloneHandle(),
+    uniffi_fcast_sender_sdk_fn_method_deviceeventhandler_speed_changed(
+            self.uniffiCloneHandle(),
         FfiConverterDouble.lower(speed),$0
     )
 }
 }
     
 open func sourceChanged(source: Source)  {try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_deviceeventhandler_source_changed(self.uniffiCloneHandle(),
+    uniffi_fcast_sender_sdk_fn_method_deviceeventhandler_source_changed(
+            self.uniffiCloneHandle(),
         FfiConverterTypeSource_lower(source),$0
     )
 }
 }
     
-open func keyEvent(event: GenericKeyEvent)  {try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_deviceeventhandler_key_event(self.uniffiCloneHandle(),
-        FfiConverterTypeGenericKeyEvent_lower(event),$0
-    )
-}
-}
-    
-open func mediaEvent(event: GenericMediaEvent)  {try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_deviceeventhandler_media_event(self.uniffiCloneHandle(),
-        FfiConverterTypeGenericMediaEvent_lower(event),$0
+    /**
+     * Called when the current media item's playback is **stopped**, that is,
+     * explicitly terminated before reaching its natural end, either because a
+     * stop was requested (e.g. via [`CastingDevice::stop_playback`]).
+     *
+     * This is deliberately distinct from playback *ending*. A media item that
+     * plays through to completion is reported as [`PlaybackState::Ended`] via
+     * [`DeviceEventHandler::playback_state_changed`].
+     */
+open func playbackStopped()  {try! rustCall() {
+    uniffi_fcast_sender_sdk_fn_method_deviceeventhandler_playback_stopped(
+            self.uniffiCloneHandle(),$0
     )
 }
 }
     
 open func playbackError(message: String)  {try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_deviceeventhandler_playback_error(self.uniffiCloneHandle(),
+    uniffi_fcast_sender_sdk_fn_method_deviceeventhandler_playback_error(
+            self.uniffiCloneHandle(),
         FfiConverterString.lower(message),$0
     )
 }
 }
     
+open func tracksAvailable(tracks: [MediaTrack])  {try! rustCall() {
+    uniffi_fcast_sender_sdk_fn_method_deviceeventhandler_tracks_available(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceTypeMediaTrack.lower(tracks),$0
+    )
+}
+}
+    
+open func trackSelected(id: UInt32?, typ: MediaTrackType)  {try! rustCall() {
+    uniffi_fcast_sender_sdk_fn_method_deviceeventhandler_track_selected(
+            self.uniffiCloneHandle(),
+        FfiConverterOptionUInt32.lower(id),
+        FfiConverterTypeMediaTrackType_lower(typ),$0
+    )
+}
+}
+    
+    /**
+     * The available tracks and/or the current per-type selection changed.
+     *
+     * Carries the full track list plus the selected id for each track type in one coherent
+     * snapshot, aggregating what the finer-grained [`tracks_available`](Self::tracks_available) and
+     * [`track_selected`](Self::track_selected) callbacks report separately. Prefer this for
+     * driving UI. FCast v4 only.
+     */
+open func tracksChanged(tracks: TrackList)  {try! rustCall() {
+    uniffi_fcast_sender_sdk_fn_method_deviceeventhandler_tracks_changed(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeTrackList_lower(tracks),$0
+    )
+}
+}
+    
+    /**
+     * The receiver's queue changed.
+     *
+     * Fires on the initial queue load, on an insertion or removal, and on a selection change,
+     * regardless of whether this sender or another connected sender caused it. Carries the full
+     * current queue. When the queue ends (playback stops or a single-item load replaces it) one
+     * final empty snapshot is delivered. FCast v4 only.
+     */
+open func queueChanged(queue: QueueState)  {try! rustCall() {
+    uniffi_fcast_sender_sdk_fn_method_deviceeventhandler_queue_changed(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeQueueState_lower(queue),$0
+    )
+}
+}
+    
+    /**
+     * The receiver rejected a command this sender issued (e.g. a queue mutation that was out of
+     * range, targeted the playing item, or hit the queue size cap). FCast v4 only.
+     */
+open func commandError(error: ReceiverError)  {try! rustCall() {
+    uniffi_fcast_sender_sdk_fn_method_deviceeventhandler_command_error(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeReceiverError_lower(error),$0
+    )
+}
+}
+    
 
+    
 }
 
 
@@ -1819,9 +2280,8 @@ fileprivate struct UniffiCallbackInterfaceDeviceEventHandler {
     // Create the VTable using a series of closures.
     // Swift automatically converts these into C callback functions.
     //
-    // This creates 1-element array, since this seems to be the only way to construct a const
-    // pointer that we can pass to the Rust code.
-    static let vtable: [UniffiVTableCallbackInterfaceDeviceEventHandler] = [UniffiVTableCallbackInterfaceDeviceEventHandler(
+    // Store the vtable directly.
+    static let vtable: UniffiVTableCallbackInterfaceDeviceEventHandler = UniffiVTableCallbackInterfaceDeviceEventHandler(
         uniffiFree: { (uniffiHandle: UInt64) -> () in
             do {
                 try FfiConverterTypeDeviceEventHandler.handleMap.remove(handle: uniffiHandle)
@@ -2004,9 +2464,8 @@ fileprivate struct UniffiCallbackInterfaceDeviceEventHandler {
                 writeReturn: writeReturn
             )
         },
-        keyEvent: { (
+        playbackStopped: { (
             uniffiHandle: UInt64,
-            event: RustBuffer,
             uniffiOutReturn: UnsafeMutableRawPointer,
             uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
         ) in
@@ -2015,32 +2474,7 @@ fileprivate struct UniffiCallbackInterfaceDeviceEventHandler {
                 guard let uniffiObj = try? FfiConverterTypeDeviceEventHandler.handleMap.get(handle: uniffiHandle) else {
                     throw UniffiInternalError.unexpectedStaleHandle
                 }
-                return uniffiObj.keyEvent(
-                     event: try FfiConverterTypeGenericKeyEvent_lift(event)
-                )
-            }
-
-            
-            let writeReturn = { () }
-            uniffiTraitInterfaceCall(
-                callStatus: uniffiCallStatus,
-                makeCall: makeCall,
-                writeReturn: writeReturn
-            )
-        },
-        mediaEvent: { (
-            uniffiHandle: UInt64,
-            event: RustBuffer,
-            uniffiOutReturn: UnsafeMutableRawPointer,
-            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
-        ) in
-            let makeCall = {
-                () throws -> () in
-                guard let uniffiObj = try? FfiConverterTypeDeviceEventHandler.handleMap.get(handle: uniffiHandle) else {
-                    throw UniffiInternalError.unexpectedStaleHandle
-                }
-                return uniffiObj.mediaEvent(
-                     event: try FfiConverterTypeGenericMediaEvent_lift(event)
+                return uniffiObj.playbackStopped(
                 )
             }
 
@@ -2075,12 +2509,146 @@ fileprivate struct UniffiCallbackInterfaceDeviceEventHandler {
                 makeCall: makeCall,
                 writeReturn: writeReturn
             )
+        },
+        tracksAvailable: { (
+            uniffiHandle: UInt64,
+            tracks: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeDeviceEventHandler.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.tracksAvailable(
+                     tracks: try FfiConverterSequenceTypeMediaTrack.lift(tracks)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        },
+        trackSelected: { (
+            uniffiHandle: UInt64,
+            id: RustBuffer,
+            typ: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeDeviceEventHandler.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.trackSelected(
+                     id: try FfiConverterOptionUInt32.lift(id),
+                     typ: try FfiConverterTypeMediaTrackType_lift(typ)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        },
+        tracksChanged: { (
+            uniffiHandle: UInt64,
+            tracks: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeDeviceEventHandler.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.tracksChanged(
+                     tracks: try FfiConverterTypeTrackList_lift(tracks)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        },
+        queueChanged: { (
+            uniffiHandle: UInt64,
+            queue: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeDeviceEventHandler.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.queueChanged(
+                     queue: try FfiConverterTypeQueueState_lift(queue)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        },
+        commandError: { (
+            uniffiHandle: UInt64,
+            error: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeDeviceEventHandler.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.commandError(
+                     error: try FfiConverterTypeReceiverError_lift(error)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
         }
-    )]
+    )
+
+    // Rust stores this pointer for future callback invocations, so it must live
+    // for the process lifetime (not just for the init function call).
+    //
+    // `nonisolated(unsafe)` is needed under Swift 6 strict concurrency.
+    // This is safe because the pointee is initialized once during static init
+    // and never mutated by either side of the FFI.  Its fields are C function pointers.
+    nonisolated(unsafe) static let vtablePtr: UnsafePointer<UniffiVTableCallbackInterfaceDeviceEventHandler> = {
+        let ptr = UnsafeMutablePointer<UniffiVTableCallbackInterfaceDeviceEventHandler>.allocate(capacity: 1)
+        ptr.initialize(to: vtable)
+        return UnsafePointer(ptr)
+    }()
 }
 
 private func uniffiCallbackInitDeviceEventHandler() {
-    uniffi_fcast_sender_sdk_fn_init_callback_vtable_deviceeventhandler(UniffiCallbackInterfaceDeviceEventHandler.vtable)
+    uniffi_fcast_sender_sdk_fn_init_callback_vtable_deviceeventhandler(UniffiCallbackInterfaceDeviceEventHandler.vtablePtr)
 }
 
 #if swift(>=5.8)
@@ -2124,7 +2692,6 @@ public struct FfiConverterTypeDeviceEventHandler: FfiConverter {
 }
 
 
-
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
@@ -2146,15 +2713,19 @@ public func FfiConverterTypeDeviceEventHandler_lower(_ value: DeviceEventHandler
 
 public protocol FCastDeviceProtocol: AnyObject, Sendable {
     
+    func addSubtitleSource(subtitle: SubtitleSource) throws 
+    
     func castingProtocol()  -> ProtocolType
     
-    func changeSpeed(speed: Double) throws
+    func changeSpeed(speed: Double) throws 
     
-    func changeVolume(volume: Double) throws
+    func changeTrack(id: UInt32?, trackType: MediaTrackType) throws 
     
-    func connect(appInfo: ApplicationInfo?, eventHandler: DeviceEventHandler, reconnectIntervalMillis: UInt64) throws
+    func changeVolume(volume: Double) throws 
     
-    func disconnect() throws
+    func connect(appInfo: ApplicationInfo?, eventHandler: DeviceEventHandler, reconnectIntervalMillis: UInt64) throws 
+    
+    func disconnect() throws 
     
     func getAddresses()  -> [IpAddr]
     
@@ -2164,35 +2735,45 @@ public protocol FCastDeviceProtocol: AnyObject, Sendable {
     
     func isReady()  -> Bool
     
-    func load(request: LoadRequest) throws
+    func load(request: LoadRequest, progressUpdateIntervalMillis: UInt64?) throws 
+    
+    func loadQueue(queue: Queue) throws 
     
     func name()  -> String
     
-    func pausePlayback() throws
+    func pausePlayback() throws 
     
-    func playlistItemNext() throws
+    func playlistItemNext() throws 
     
-    func playlistItemPrevious() throws
+    func playlistItemPrevious() throws 
     
-    func resumePlayback() throws
+    func queueAdd(item: QueueItem, position: QueuePosition) throws 
     
-    func seek(timeSeconds: Double) throws
+    func queueInsert(item: MediaItem, playbackDuration: Double?, position: QueuePosition) throws 
     
-    func setAddresses(addrs: [IpAddr])
+    func queueRemove(position: QueuePosition) throws 
     
-    func setName(name: String)
+    func queueSelect(position: QueuePosition) throws 
     
-    func setPlaylistItemIndex(index: UInt32) throws
+    func resumePlayback() throws 
     
-    func setPort(port: UInt16)
+    func seek(timeSeconds: Double) throws 
     
-    func stopPlayback() throws
+    func setAddresses(addrs: [IpAddr]) 
     
-    func subscribeEvent(group: GenericEventSubscriptionGroup) throws
+    func setName(name: String) 
+    
+    func setPlaylistItemIndex(index: UInt32) throws 
+    
+    func setPort(port: UInt16) 
+    
+    func setProgressUpdateInterval(intervalMillis: UInt64) throws 
+    
+    func startMirroringSession(signaller: FwrtcSignaller) throws 
+    
+    func stopPlayback() throws 
     
     func supportsFeature(feature: DeviceFeature)  -> Bool
-    
-    func unsubscribeEvent(group: GenericEventSubscriptionGroup) throws
     
 }
 open class FCastDevice: FCastDeviceProtocol, @unchecked Sendable {
@@ -2237,35 +2818,61 @@ open class FCastDevice: FCastDeviceProtocol, @unchecked Sendable {
     // No primary constructor declared for this class.
 
     deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
         try! rustCall { uniffi_fcast_sender_sdk_fn_free_fcastdevice(handle, $0) }
     }
 
     
 
     
+open func addSubtitleSource(subtitle: SubtitleSource)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
+    uniffi_fcast_sender_sdk_fn_method_fcastdevice_add_subtitle_source(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeSubtitleSource_lower(subtitle),$0
+    )
+}
+}
+    
 open func castingProtocol() -> ProtocolType  {
     return try!  FfiConverterTypeProtocolType_lift(try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_fcastdevice_casting_protocol(self.uniffiCloneHandle(),$0
+    uniffi_fcast_sender_sdk_fn_method_fcastdevice_casting_protocol(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
     
 open func changeSpeed(speed: Double)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_fcastdevice_change_speed(self.uniffiCloneHandle(),
+    uniffi_fcast_sender_sdk_fn_method_fcastdevice_change_speed(
+            self.uniffiCloneHandle(),
         FfiConverterDouble.lower(speed),$0
     )
 }
 }
     
+open func changeTrack(id: UInt32?, trackType: MediaTrackType)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
+    uniffi_fcast_sender_sdk_fn_method_fcastdevice_change_track(
+            self.uniffiCloneHandle(),
+        FfiConverterOptionUInt32.lower(id),
+        FfiConverterTypeMediaTrackType_lower(trackType),$0
+    )
+}
+}
+    
 open func changeVolume(volume: Double)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_fcastdevice_change_volume(self.uniffiCloneHandle(),
+    uniffi_fcast_sender_sdk_fn_method_fcastdevice_change_volume(
+            self.uniffiCloneHandle(),
         FfiConverterDouble.lower(volume),$0
     )
 }
 }
     
 open func connect(appInfo: ApplicationInfo?, eventHandler: DeviceEventHandler, reconnectIntervalMillis: UInt64)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_fcastdevice_connect(self.uniffiCloneHandle(),
+    uniffi_fcast_sender_sdk_fn_method_fcastdevice_connect(
+            self.uniffiCloneHandle(),
         FfiConverterOptionTypeApplicationInfo.lower(appInfo),
         FfiConverterTypeDeviceEventHandler_lower(eventHandler),
         FfiConverterUInt64.lower(reconnectIntervalMillis),$0
@@ -2274,141 +2881,206 @@ open func connect(appInfo: ApplicationInfo?, eventHandler: DeviceEventHandler, r
 }
     
 open func disconnect()throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_fcastdevice_disconnect(self.uniffiCloneHandle(),$0
+    uniffi_fcast_sender_sdk_fn_method_fcastdevice_disconnect(
+            self.uniffiCloneHandle(),$0
     )
 }
 }
     
 open func getAddresses() -> [IpAddr]  {
     return try!  FfiConverterSequenceTypeIpAddr.lift(try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_fcastdevice_get_addresses(self.uniffiCloneHandle(),$0
+    uniffi_fcast_sender_sdk_fn_method_fcastdevice_get_addresses(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
     
 open func getDeviceInfo() -> DeviceInfo  {
     return try!  FfiConverterTypeDeviceInfo_lift(try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_fcastdevice_get_device_info(self.uniffiCloneHandle(),$0
+    uniffi_fcast_sender_sdk_fn_method_fcastdevice_get_device_info(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
     
 open func getPort() -> UInt16  {
     return try!  FfiConverterUInt16.lift(try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_fcastdevice_get_port(self.uniffiCloneHandle(),$0
+    uniffi_fcast_sender_sdk_fn_method_fcastdevice_get_port(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
     
 open func isReady() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_fcastdevice_is_ready(self.uniffiCloneHandle(),$0
+    uniffi_fcast_sender_sdk_fn_method_fcastdevice_is_ready(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
     
-open func load(request: LoadRequest)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_fcastdevice_load(self.uniffiCloneHandle(),
-        FfiConverterTypeLoadRequest_lower(request),$0
+open func load(request: LoadRequest, progressUpdateIntervalMillis: UInt64?)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
+    uniffi_fcast_sender_sdk_fn_method_fcastdevice_load(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeLoadRequest_lower(request),
+        FfiConverterOptionUInt64.lower(progressUpdateIntervalMillis),$0
+    )
+}
+}
+    
+open func loadQueue(queue: Queue)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
+    uniffi_fcast_sender_sdk_fn_method_fcastdevice_load_queue(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeQueue_lower(queue),$0
     )
 }
 }
     
 open func name() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_fcastdevice_name(self.uniffiCloneHandle(),$0
+    uniffi_fcast_sender_sdk_fn_method_fcastdevice_name(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
     
 open func pausePlayback()throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_fcastdevice_pause_playback(self.uniffiCloneHandle(),$0
+    uniffi_fcast_sender_sdk_fn_method_fcastdevice_pause_playback(
+            self.uniffiCloneHandle(),$0
     )
 }
 }
     
 open func playlistItemNext()throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_fcastdevice_playlist_item_next(self.uniffiCloneHandle(),$0
+    uniffi_fcast_sender_sdk_fn_method_fcastdevice_playlist_item_next(
+            self.uniffiCloneHandle(),$0
     )
 }
 }
     
 open func playlistItemPrevious()throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_fcastdevice_playlist_item_previous(self.uniffiCloneHandle(),$0
+    uniffi_fcast_sender_sdk_fn_method_fcastdevice_playlist_item_previous(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+open func queueAdd(item: QueueItem, position: QueuePosition)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
+    uniffi_fcast_sender_sdk_fn_method_fcastdevice_queue_add(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeQueueItem_lower(item),
+        FfiConverterTypeQueuePosition_lower(position),$0
+    )
+}
+}
+    
+open func queueInsert(item: MediaItem, playbackDuration: Double?, position: QueuePosition)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
+    uniffi_fcast_sender_sdk_fn_method_fcastdevice_queue_insert(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeMediaItem_lower(item),
+        FfiConverterOptionDouble.lower(playbackDuration),
+        FfiConverterTypeQueuePosition_lower(position),$0
+    )
+}
+}
+    
+open func queueRemove(position: QueuePosition)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
+    uniffi_fcast_sender_sdk_fn_method_fcastdevice_queue_remove(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeQueuePosition_lower(position),$0
+    )
+}
+}
+    
+open func queueSelect(position: QueuePosition)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
+    uniffi_fcast_sender_sdk_fn_method_fcastdevice_queue_select(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeQueuePosition_lower(position),$0
     )
 }
 }
     
 open func resumePlayback()throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_fcastdevice_resume_playback(self.uniffiCloneHandle(),$0
+    uniffi_fcast_sender_sdk_fn_method_fcastdevice_resume_playback(
+            self.uniffiCloneHandle(),$0
     )
 }
 }
     
 open func seek(timeSeconds: Double)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_fcastdevice_seek(self.uniffiCloneHandle(),
+    uniffi_fcast_sender_sdk_fn_method_fcastdevice_seek(
+            self.uniffiCloneHandle(),
         FfiConverterDouble.lower(timeSeconds),$0
     )
 }
 }
     
 open func setAddresses(addrs: [IpAddr])  {try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_fcastdevice_set_addresses(self.uniffiCloneHandle(),
+    uniffi_fcast_sender_sdk_fn_method_fcastdevice_set_addresses(
+            self.uniffiCloneHandle(),
         FfiConverterSequenceTypeIpAddr.lower(addrs),$0
     )
 }
 }
     
 open func setName(name: String)  {try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_fcastdevice_set_name(self.uniffiCloneHandle(),
+    uniffi_fcast_sender_sdk_fn_method_fcastdevice_set_name(
+            self.uniffiCloneHandle(),
         FfiConverterString.lower(name),$0
     )
 }
 }
     
 open func setPlaylistItemIndex(index: UInt32)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_fcastdevice_set_playlist_item_index(self.uniffiCloneHandle(),
+    uniffi_fcast_sender_sdk_fn_method_fcastdevice_set_playlist_item_index(
+            self.uniffiCloneHandle(),
         FfiConverterUInt32.lower(index),$0
     )
 }
 }
     
 open func setPort(port: UInt16)  {try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_fcastdevice_set_port(self.uniffiCloneHandle(),
+    uniffi_fcast_sender_sdk_fn_method_fcastdevice_set_port(
+            self.uniffiCloneHandle(),
         FfiConverterUInt16.lower(port),$0
     )
 }
 }
     
-open func stopPlayback()throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_fcastdevice_stop_playback(self.uniffiCloneHandle(),$0
+open func setProgressUpdateInterval(intervalMillis: UInt64)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
+    uniffi_fcast_sender_sdk_fn_method_fcastdevice_set_progress_update_interval(
+            self.uniffiCloneHandle(),
+        FfiConverterUInt64.lower(intervalMillis),$0
     )
 }
 }
     
-open func subscribeEvent(group: GenericEventSubscriptionGroup)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_fcastdevice_subscribe_event(self.uniffiCloneHandle(),
-        FfiConverterTypeGenericEventSubscriptionGroup_lower(group),$0
+open func startMirroringSession(signaller: FwrtcSignaller)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
+    uniffi_fcast_sender_sdk_fn_method_fcastdevice_start_mirroring_session(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeFWRTCSignaller_lower(signaller),$0
+    )
+}
+}
+    
+open func stopPlayback()throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
+    uniffi_fcast_sender_sdk_fn_method_fcastdevice_stop_playback(
+            self.uniffiCloneHandle(),$0
     )
 }
 }
     
 open func supportsFeature(feature: DeviceFeature) -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_method_fcastdevice_supports_feature(self.uniffiCloneHandle(),
+    uniffi_fcast_sender_sdk_fn_method_fcastdevice_supports_feature(
+            self.uniffiCloneHandle(),
         FfiConverterTypeDeviceFeature_lower(feature),$0
     )
 })
 }
     
-open func unsubscribeEvent(group: GenericEventSubscriptionGroup)throws   {try rustCallWithError(FfiConverterTypeCastingDeviceError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_fcastdevice_unsubscribe_event(self.uniffiCloneHandle(),
-        FfiConverterTypeGenericEventSubscriptionGroup_lower(group),$0
-    )
-}
-}
-    
 
+    
 }
 
 
@@ -2440,7 +3112,6 @@ extension FCastDevice: CastingDeviceProtocol {}
 
 
 
-
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
@@ -2460,12 +3131,14 @@ public func FfiConverterTypeFCastDevice_lower(_ value: FCastDevice) -> UInt64 {
 
 
 
-public protocol FileServerProtocol: AnyObject, Sendable {
+public protocol FwrtcSignaller: AnyObject, Sendable {
     
-    func serveFile(fd: Int32) throws  -> FileStoreEntry
+    func setOfferSink(sink: MirroringOfferSink) 
+    
+    func onAnswerReceived(answer: String) 
     
 }
-open class FileServer: FileServerProtocol, @unchecked Sendable {
+open class FwrtcSignallerImpl: FwrtcSignaller, @unchecked Sendable {
     fileprivate let handle: UInt64
 
     /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
@@ -2502,74 +3175,314 @@ open class FileServer: FileServerProtocol, @unchecked Sendable {
     @_documentation(visibility: private)
 #endif
     public func uniffiCloneHandle() -> UInt64 {
-        return try! rustCall { uniffi_fcast_sender_sdk_fn_clone_fileserver(self.handle, $0) }
+        return try! rustCall { uniffi_fcast_sender_sdk_fn_clone_fwrtcsignaller(self.handle, $0) }
     }
     // No primary constructor declared for this class.
 
     deinit {
-        try! rustCall { uniffi_fcast_sender_sdk_fn_free_fileserver(handle, $0) }
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_fcast_sender_sdk_fn_free_fwrtcsignaller(handle, $0) }
     }
 
     
 
     
-open func serveFile(fd: Int32)throws  -> FileStoreEntry  {
-    return try  FfiConverterTypeFileStoreEntry_lift(try rustCallWithError(FfiConverterTypeFileServerError_lift) {
-    uniffi_fcast_sender_sdk_fn_method_fileserver_serve_file(self.uniffiCloneHandle(),
-        FfiConverterInt32.lower(fd),$0
+open func setOfferSink(sink: MirroringOfferSink)  {try! rustCall() {
+    uniffi_fcast_sender_sdk_fn_method_fwrtcsignaller_set_offer_sink(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeMirroringOfferSink_lower(sink),$0
     )
-})
+}
+}
+    
+open func onAnswerReceived(answer: String)  {try! rustCall() {
+    uniffi_fcast_sender_sdk_fn_method_fwrtcsignaller_on_answer_received(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(answer),$0
+    )
+}
 }
     
 
+    
 }
 
+
+
+// Put the implementation in a struct so we don't pollute the top-level namespace
+fileprivate struct UniffiCallbackInterfaceFWRTCSignaller {
+
+    // Create the VTable using a series of closures.
+    // Swift automatically converts these into C callback functions.
+    //
+    // Store the vtable directly.
+    static let vtable: UniffiVTableCallbackInterfaceFwrtcSignaller = UniffiVTableCallbackInterfaceFwrtcSignaller(
+        uniffiFree: { (uniffiHandle: UInt64) -> () in
+            do {
+                try FfiConverterTypeFWRTCSignaller.handleMap.remove(handle: uniffiHandle)
+            } catch {
+                print("Uniffi callback interface FWRTCSignaller: handle missing in uniffiFree")
+            }
+        },
+        uniffiClone: { (uniffiHandle: UInt64) -> UInt64 in
+            do {
+                return try FfiConverterTypeFWRTCSignaller.handleMap.clone(handle: uniffiHandle)
+            } catch {
+                fatalError("Uniffi callback interface FWRTCSignaller: handle missing in uniffiClone")
+            }
+        },
+        setOfferSink: { (
+            uniffiHandle: UInt64,
+            sink: UInt64,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeFWRTCSignaller.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.setOfferSink(
+                     sink: try FfiConverterTypeMirroringOfferSink_lift(sink)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        },
+        onAnswerReceived: { (
+            uniffiHandle: UInt64,
+            answer: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeFWRTCSignaller.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onAnswerReceived(
+                     answer: try FfiConverterString.lift(answer)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        }
+    )
+
+    // Rust stores this pointer for future callback invocations, so it must live
+    // for the process lifetime (not just for the init function call).
+    //
+    // `nonisolated(unsafe)` is needed under Swift 6 strict concurrency.
+    // This is safe because the pointee is initialized once during static init
+    // and never mutated by either side of the FFI.  Its fields are C function pointers.
+    nonisolated(unsafe) static let vtablePtr: UnsafePointer<UniffiVTableCallbackInterfaceFwrtcSignaller> = {
+        let ptr = UnsafeMutablePointer<UniffiVTableCallbackInterfaceFwrtcSignaller>.allocate(capacity: 1)
+        ptr.initialize(to: vtable)
+        return UnsafePointer(ptr)
+    }()
+}
+
+private func uniffiCallbackInitFWRTCSignaller() {
+    uniffi_fcast_sender_sdk_fn_init_callback_vtable_fwrtcsignaller(UniffiCallbackInterfaceFWRTCSignaller.vtablePtr)
+}
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public struct FfiConverterTypeFileServer: FfiConverter {
+public struct FfiConverterTypeFWRTCSignaller: FfiConverter {
+    fileprivate static let handleMap = UniffiHandleMap<FwrtcSignaller>()
+
     typealias FfiType = UInt64
-    typealias SwiftType = FileServer
+    typealias SwiftType = FwrtcSignaller
 
-    public static func lift(_ handle: UInt64) throws -> FileServer {
-        return FileServer(unsafeFromHandle: handle)
+    public static func lift(_ handle: UInt64) throws -> FwrtcSignaller {
+        if ((handle & 1) == 0) {
+            // Rust-generated handle, construct a new class that uses the handle to implement the
+            // interface
+            return FwrtcSignallerImpl(unsafeFromHandle: handle)
+        } else {
+            // Swift-generated handle, get the object from the handle map
+            return try handleMap.remove(handle: handle)
+        }
     }
 
-    public static func lower(_ value: FileServer) -> UInt64 {
-        return value.uniffiCloneHandle()
+    public static func lower(_ value: FwrtcSignaller) -> UInt64 {
+         if let rustImpl = value as? FwrtcSignallerImpl {
+             // Rust-implemented object.  Clone the handle and return it
+            return rustImpl.uniffiCloneHandle()
+         } else {
+            // Swift object, generate a new vtable handle and return that.
+            return handleMap.insert(obj: value)
+         }
     }
 
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FileServer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FwrtcSignaller {
         let handle: UInt64 = try readInt(&buf)
         return try lift(handle)
     }
 
-    public static func write(_ value: FileServer, into buf: inout [UInt8]) {
+    public static func write(_ value: FwrtcSignaller, into buf: inout [UInt8]) {
         writeInt(&buf, lower(value))
     }
 }
 
 
-
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeFileServer_lift(_ handle: UInt64) throws -> FileServer {
-    return try FfiConverterTypeFileServer.lift(handle)
+public func FfiConverterTypeFWRTCSignaller_lift(_ handle: UInt64) throws -> FwrtcSignaller {
+    return try FfiConverterTypeFWRTCSignaller.lift(handle)
 }
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeFileServer_lower(_ value: FileServer) -> UInt64 {
-    return FfiConverterTypeFileServer.lower(value)
+public func FfiConverterTypeFWRTCSignaller_lower(_ value: FwrtcSignaller) -> UInt64 {
+    return FfiConverterTypeFWRTCSignaller.lower(value)
 }
 
 
 
 
-public struct ApplicationInfo {
+
+
+public protocol MirroringOfferSinkProtocol: AnyObject, Sendable {
+    
+    /**
+     * Deliver the SDP offer to the SDK.
+     */
+    func sendOffer(sdp: String) 
+    
+}
+open class MirroringOfferSink: MirroringOfferSinkProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_fcast_sender_sdk_fn_clone_mirroringoffersink(self.handle, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_fcast_sender_sdk_fn_free_mirroringoffersink(handle, $0) }
+    }
+
+    
+
+    
+    /**
+     * Deliver the SDP offer to the SDK.
+     */
+open func sendOffer(sdp: String)  {try! rustCall() {
+    uniffi_fcast_sender_sdk_fn_method_mirroringoffersink_send_offer(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(sdp),$0
+    )
+}
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMirroringOfferSink: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = MirroringOfferSink
+
+    public static func lift(_ handle: UInt64) throws -> MirroringOfferSink {
+        return MirroringOfferSink(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: MirroringOfferSink) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MirroringOfferSink {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: MirroringOfferSink, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMirroringOfferSink_lift(_ handle: UInt64) throws -> MirroringOfferSink {
+    return try FfiConverterTypeMirroringOfferSink.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMirroringOfferSink_lower(_ value: MirroringOfferSink) -> UInt64 {
+    return FfiConverterTypeMirroringOfferSink.lower(value)
+}
+
+
+
+
+public struct ApplicationInfo: Equatable, Hashable {
     public var name: String
     public var version: String
     public var displayName: String
@@ -2581,35 +3494,15 @@ public struct ApplicationInfo {
         self.version = version
         self.displayName = displayName
     }
+
+    
+
+    
 }
 
 #if compiler(>=6)
 extension ApplicationInfo: Sendable {}
 #endif
-
-
-extension ApplicationInfo: Equatable, Hashable {
-    public static func ==(lhs: ApplicationInfo, rhs: ApplicationInfo) -> Bool {
-        if lhs.name != rhs.name {
-            return false
-        }
-        if lhs.version != rhs.version {
-            return false
-        }
-        if lhs.displayName != rhs.displayName {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(name)
-        hasher.combine(version)
-        hasher.combine(displayName)
-    }
-}
-
-
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
@@ -2618,8 +3511,8 @@ public struct FfiConverterTypeApplicationInfo: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ApplicationInfo {
         return
             try ApplicationInfo(
-                name: FfiConverterString.read(from: &buf),
-                version: FfiConverterString.read(from: &buf),
+                name: FfiConverterString.read(from: &buf), 
+                version: FfiConverterString.read(from: &buf), 
                 displayName: FfiConverterString.read(from: &buf)
         )
     }
@@ -2647,53 +3540,141 @@ public func FfiConverterTypeApplicationInfo_lower(_ value: ApplicationInfo) -> R
 }
 
 
-public struct DeviceInfo {
+public struct AudioCapabilities: Equatable, Hashable {
+    /**
+     * The receiver's volume step granularity, e.g. `0.01` for 1%.
+     */
+    public var volumeStepInterval: Float
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The receiver's volume step granularity, e.g. `0.01` for 1%.
+         */volumeStepInterval: Float) {
+        self.volumeStepInterval = volumeStepInterval
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension AudioCapabilities: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeAudioCapabilities: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AudioCapabilities {
+        return
+            try AudioCapabilities(
+                volumeStepInterval: FfiConverterFloat.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: AudioCapabilities, into buf: inout [UInt8]) {
+        FfiConverterFloat.write(value.volumeStepInterval, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAudioCapabilities_lift(_ buf: RustBuffer) throws -> AudioCapabilities {
+    return try FfiConverterTypeAudioCapabilities.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAudioCapabilities_lower(_ value: AudioCapabilities) -> RustBuffer {
+    return FfiConverterTypeAudioCapabilities.lower(value)
+}
+
+
+public struct CompanionSource: Equatable, Hashable {
+    public var descriptor: CompanionSourceDescriptor
+    public var contentType: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(descriptor: CompanionSourceDescriptor, contentType: String) {
+        self.descriptor = descriptor
+        self.contentType = contentType
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension CompanionSource: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCompanionSource: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CompanionSource {
+        return
+            try CompanionSource(
+                descriptor: FfiConverterTypeCompanionSourceDescriptor.read(from: &buf), 
+                contentType: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CompanionSource, into buf: inout [UInt8]) {
+        FfiConverterTypeCompanionSourceDescriptor.write(value.descriptor, into: &buf)
+        FfiConverterString.write(value.contentType, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCompanionSource_lift(_ buf: RustBuffer) throws -> CompanionSource {
+    return try FfiConverterTypeCompanionSource.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCompanionSource_lower(_ value: CompanionSource) -> RustBuffer {
+    return FfiConverterTypeCompanionSource.lower(value)
+}
+
+
+public struct DeviceInfo: Equatable, Hashable {
     public var name: String
     public var `protocol`: ProtocolType
     public var addresses: [IpAddr]
     public var port: UInt16
+    public var txtRecords: [String: String]
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(name: String, `protocol`: ProtocolType, addresses: [IpAddr], port: UInt16) {
+    public init(name: String, `protocol`: ProtocolType, addresses: [IpAddr], port: UInt16, txtRecords: [String: String]) {
         self.name = name
         self.`protocol` = `protocol`
         self.addresses = addresses
         self.port = port
+        self.txtRecords = txtRecords
     }
+
+    
+
+    
 }
 
 #if compiler(>=6)
 extension DeviceInfo: Sendable {}
 #endif
-
-
-extension DeviceInfo: Equatable, Hashable {
-    public static func ==(lhs: DeviceInfo, rhs: DeviceInfo) -> Bool {
-        if lhs.name != rhs.name {
-            return false
-        }
-        if lhs.`protocol` != rhs.`protocol` {
-            return false
-        }
-        if lhs.addresses != rhs.addresses {
-            return false
-        }
-        if lhs.port != rhs.port {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(name)
-        hasher.combine(`protocol`)
-        hasher.combine(addresses)
-        hasher.combine(port)
-    }
-}
-
-
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
@@ -2702,10 +3683,11 @@ public struct FfiConverterTypeDeviceInfo: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DeviceInfo {
         return
             try DeviceInfo(
-                name: FfiConverterString.read(from: &buf),
-                protocol: FfiConverterTypeProtocolType.read(from: &buf),
-                addresses: FfiConverterSequenceTypeIpAddr.read(from: &buf),
-                port: FfiConverterUInt16.read(from: &buf)
+                name: FfiConverterString.read(from: &buf), 
+                protocol: FfiConverterTypeProtocolType.read(from: &buf), 
+                addresses: FfiConverterSequenceTypeIpAddr.read(from: &buf), 
+                port: FfiConverterUInt16.read(from: &buf), 
+                txtRecords: FfiConverterDictionaryStringString.read(from: &buf)
         )
     }
 
@@ -2714,6 +3696,7 @@ public struct FfiConverterTypeDeviceInfo: FfiConverterRustBuffer {
         FfiConverterTypeProtocolType.write(value.`protocol`, into: &buf)
         FfiConverterSequenceTypeIpAddr.write(value.addresses, into: &buf)
         FfiConverterUInt16.write(value.port, into: &buf)
+        FfiConverterDictionaryStringString.write(value.txtRecords, into: &buf)
     }
 }
 
@@ -2733,60 +3716,126 @@ public func FfiConverterTypeDeviceInfo_lower(_ value: DeviceInfo) -> RustBuffer 
 }
 
 
+public struct DisplayCapabilities: Equatable, Hashable {
+    public var resolution: VideoResolution?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(resolution: VideoResolution?) {
+        self.resolution = resolution
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension DisplayCapabilities: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDisplayCapabilities: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DisplayCapabilities {
+        return
+            try DisplayCapabilities(
+                resolution: FfiConverterOptionTypeVideoResolution.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: DisplayCapabilities, into buf: inout [UInt8]) {
+        FfiConverterOptionTypeVideoResolution.write(value.resolution, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDisplayCapabilities_lift(_ buf: RustBuffer) throws -> DisplayCapabilities {
+    return try FfiConverterTypeDisplayCapabilities.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDisplayCapabilities_lower(_ value: DisplayCapabilities) -> RustBuffer {
+    return FfiConverterTypeDisplayCapabilities.lower(value)
+}
+
+
 /**
- * http://:{port}/{location}
+ * The media formats a receiver supports.
+ *
+ * Each list holds short, lowercase, canonical format tokens (e.g. `"mp4"`,
+ * `"h264"`, `"whep"`) as defined by the FCast protocol. These are distinct
+ * from the MIME `container` a sender puts on a loaded item.
  */
-public struct FileStoreEntry {
-    public var location: String
-    public var port: UInt16
+public struct MediaCapabilities: Equatable, Hashable {
+    public var protocols: [String]
+    public var containers: [String]
+    public var videoFormats: [String]
+    public var audioFormats: [String]
+    public var subtitleFormats: [String]
+    public var hdrFormats: [String]
+    public var imageFormats: [String]
+    public var externalSubtitles: Bool
+    public var mirroring: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(location: String, port: UInt16) {
-        self.location = location
-        self.port = port
+    public init(protocols: [String], containers: [String], videoFormats: [String], audioFormats: [String], subtitleFormats: [String], hdrFormats: [String], imageFormats: [String], externalSubtitles: Bool, mirroring: Bool) {
+        self.protocols = protocols
+        self.containers = containers
+        self.videoFormats = videoFormats
+        self.audioFormats = audioFormats
+        self.subtitleFormats = subtitleFormats
+        self.hdrFormats = hdrFormats
+        self.imageFormats = imageFormats
+        self.externalSubtitles = externalSubtitles
+        self.mirroring = mirroring
     }
+
+    
+
+    
 }
 
 #if compiler(>=6)
-extension FileStoreEntry: Sendable {}
+extension MediaCapabilities: Sendable {}
 #endif
-
-
-extension FileStoreEntry: Equatable, Hashable {
-    public static func ==(lhs: FileStoreEntry, rhs: FileStoreEntry) -> Bool {
-        if lhs.location != rhs.location {
-            return false
-        }
-        if lhs.port != rhs.port {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(location)
-        hasher.combine(port)
-    }
-}
-
-
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public struct FfiConverterTypeFileStoreEntry: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FileStoreEntry {
+public struct FfiConverterTypeMediaCapabilities: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MediaCapabilities {
         return
-            try FileStoreEntry(
-                location: FfiConverterString.read(from: &buf),
-                port: FfiConverterUInt16.read(from: &buf)
+            try MediaCapabilities(
+                protocols: FfiConverterSequenceString.read(from: &buf), 
+                containers: FfiConverterSequenceString.read(from: &buf), 
+                videoFormats: FfiConverterSequenceString.read(from: &buf), 
+                audioFormats: FfiConverterSequenceString.read(from: &buf), 
+                subtitleFormats: FfiConverterSequenceString.read(from: &buf), 
+                hdrFormats: FfiConverterSequenceString.read(from: &buf), 
+                imageFormats: FfiConverterSequenceString.read(from: &buf), 
+                externalSubtitles: FfiConverterBool.read(from: &buf), 
+                mirroring: FfiConverterBool.read(from: &buf)
         )
     }
 
-    public static func write(_ value: FileStoreEntry, into buf: inout [UInt8]) {
-        FfiConverterString.write(value.location, into: &buf)
-        FfiConverterUInt16.write(value.port, into: &buf)
+    public static func write(_ value: MediaCapabilities, into buf: inout [UInt8]) {
+        FfiConverterSequenceString.write(value.protocols, into: &buf)
+        FfiConverterSequenceString.write(value.containers, into: &buf)
+        FfiConverterSequenceString.write(value.videoFormats, into: &buf)
+        FfiConverterSequenceString.write(value.audioFormats, into: &buf)
+        FfiConverterSequenceString.write(value.subtitleFormats, into: &buf)
+        FfiConverterSequenceString.write(value.hdrFormats, into: &buf)
+        FfiConverterSequenceString.write(value.imageFormats, into: &buf)
+        FfiConverterBool.write(value.externalSubtitles, into: &buf)
+        FfiConverterBool.write(value.mirroring, into: &buf)
     }
 }
 
@@ -2794,85 +3843,117 @@ public struct FfiConverterTypeFileStoreEntry: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeFileStoreEntry_lift(_ buf: RustBuffer) throws -> FileStoreEntry {
-    return try FfiConverterTypeFileStoreEntry.lift(buf)
+public func FfiConverterTypeMediaCapabilities_lift(_ buf: RustBuffer) throws -> MediaCapabilities {
+    return try FfiConverterTypeMediaCapabilities.lift(buf)
 }
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeFileStoreEntry_lower(_ value: FileStoreEntry) -> RustBuffer {
-    return FfiConverterTypeFileStoreEntry.lower(value)
+public func FfiConverterTypeMediaCapabilities_lower(_ value: MediaCapabilities) -> RustBuffer {
+    return FfiConverterTypeMediaCapabilities.lower(value)
 }
 
 
-public struct GenericKeyEvent {
-    public var released: Bool
-    public var `repeat`: Bool
-    public var handled: Bool
-    public var name: String
+/**
+ * A single playable media item.
+ *
+ * This is the rich, non-lossy item type used by [`CastingDevice::load_queue`] and
+ * [`CastingDevice::queue_insert`], and the element type reported back in [`QueueState`].
+ */
+public struct MediaItem: Equatable, Hashable {
+    /**
+     * MIME container type, e.g. `"video/mp4"`.
+     */
+    public var contentType: String
+    public var source: MediaLocator
+    /**
+     * Seconds from the beginning of the media to start playback. Non-finite or negative values are
+     * treated as unset.
+     */
+    public var startTime: Double?
+    /**
+     * Initial volume, `0.0..=1.0`.
+     */
+    public var volume: Double?
+    /**
+     * Initial playback speed.
+     */
+    public var speed: Double?
+    /**
+     * HTTP request headers to send when fetching the media. Only applies to
+     * [`MediaLocator::Url`]. Not relayed to other senders.
+     */
+    public var requestHeaders: [String: String]?
+    public var title: String?
+    public var thumbnailUrl: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(released: Bool, `repeat`: Bool, handled: Bool, name: String) {
-        self.released = released
-        self.`repeat` = `repeat`
-        self.handled = handled
-        self.name = name
+    public init(
+        /**
+         * MIME container type, e.g. `"video/mp4"`.
+         */contentType: String, source: MediaLocator, 
+        /**
+         * Seconds from the beginning of the media to start playback. Non-finite or negative values are
+         * treated as unset.
+         */startTime: Double?, 
+        /**
+         * Initial volume, `0.0..=1.0`.
+         */volume: Double?, 
+        /**
+         * Initial playback speed.
+         */speed: Double?, 
+        /**
+         * HTTP request headers to send when fetching the media. Only applies to
+         * [`MediaLocator::Url`]. Not relayed to other senders.
+         */requestHeaders: [String: String]?, title: String?, thumbnailUrl: String?) {
+        self.contentType = contentType
+        self.source = source
+        self.startTime = startTime
+        self.volume = volume
+        self.speed = speed
+        self.requestHeaders = requestHeaders
+        self.title = title
+        self.thumbnailUrl = thumbnailUrl
     }
+
+    
+
+    
 }
 
 #if compiler(>=6)
-extension GenericKeyEvent: Sendable {}
+extension MediaItem: Sendable {}
 #endif
-
-
-extension GenericKeyEvent: Equatable, Hashable {
-    public static func ==(lhs: GenericKeyEvent, rhs: GenericKeyEvent) -> Bool {
-        if lhs.released != rhs.released {
-            return false
-        }
-        if lhs.`repeat` != rhs.`repeat` {
-            return false
-        }
-        if lhs.handled != rhs.handled {
-            return false
-        }
-        if lhs.name != rhs.name {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(released)
-        hasher.combine(`repeat`)
-        hasher.combine(handled)
-        hasher.combine(name)
-    }
-}
-
-
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public struct FfiConverterTypeGenericKeyEvent: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> GenericKeyEvent {
+public struct FfiConverterTypeMediaItem: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MediaItem {
         return
-            try GenericKeyEvent(
-                released: FfiConverterBool.read(from: &buf),
-                repeat: FfiConverterBool.read(from: &buf),
-                handled: FfiConverterBool.read(from: &buf),
-                name: FfiConverterString.read(from: &buf)
+            try MediaItem(
+                contentType: FfiConverterString.read(from: &buf), 
+                source: FfiConverterTypeMediaLocator.read(from: &buf), 
+                startTime: FfiConverterOptionDouble.read(from: &buf), 
+                volume: FfiConverterOptionDouble.read(from: &buf), 
+                speed: FfiConverterOptionDouble.read(from: &buf), 
+                requestHeaders: FfiConverterOptionDictionaryStringString.read(from: &buf), 
+                title: FfiConverterOptionString.read(from: &buf), 
+                thumbnailUrl: FfiConverterOptionString.read(from: &buf)
         )
     }
 
-    public static func write(_ value: GenericKeyEvent, into buf: inout [UInt8]) {
-        FfiConverterBool.write(value.released, into: &buf)
-        FfiConverterBool.write(value.`repeat`, into: &buf)
-        FfiConverterBool.write(value.handled, into: &buf)
-        FfiConverterString.write(value.name, into: &buf)
+    public static func write(_ value: MediaItem, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.contentType, into: &buf)
+        FfiConverterTypeMediaLocator.write(value.source, into: &buf)
+        FfiConverterOptionDouble.write(value.startTime, into: &buf)
+        FfiConverterOptionDouble.write(value.volume, into: &buf)
+        FfiConverterOptionDouble.write(value.speed, into: &buf)
+        FfiConverterOptionDictionaryStringString.write(value.requestHeaders, into: &buf)
+        FfiConverterOptionString.write(value.title, into: &buf)
+        FfiConverterOptionString.write(value.thumbnailUrl, into: &buf)
     }
 }
 
@@ -2880,19 +3961,81 @@ public struct FfiConverterTypeGenericKeyEvent: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeGenericKeyEvent_lift(_ buf: RustBuffer) throws -> GenericKeyEvent {
-    return try FfiConverterTypeGenericKeyEvent.lift(buf)
+public func FfiConverterTypeMediaItem_lift(_ buf: RustBuffer) throws -> MediaItem {
+    return try FfiConverterTypeMediaItem.lift(buf)
 }
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeGenericKeyEvent_lower(_ value: GenericKeyEvent) -> RustBuffer {
-    return FfiConverterTypeGenericKeyEvent.lower(value)
+public func FfiConverterTypeMediaItem_lower(_ value: MediaItem) -> RustBuffer {
+    return FfiConverterTypeMediaItem.lower(value)
 }
 
 
-public struct Metadata {
+public struct MediaTrack: Equatable, Hashable {
+    public var id: UInt32
+    public var title: String?
+    public var language: String
+    public var typ: MediaTrackType
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: UInt32, title: String?, language: String, typ: MediaTrackType) {
+        self.id = id
+        self.title = title
+        self.language = language
+        self.typ = typ
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension MediaTrack: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMediaTrack: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MediaTrack {
+        return
+            try MediaTrack(
+                id: FfiConverterUInt32.read(from: &buf), 
+                title: FfiConverterOptionString.read(from: &buf), 
+                language: FfiConverterString.read(from: &buf), 
+                typ: FfiConverterTypeMediaTrackType.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MediaTrack, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.id, into: &buf)
+        FfiConverterOptionString.write(value.title, into: &buf)
+        FfiConverterString.write(value.language, into: &buf)
+        FfiConverterTypeMediaTrackType.write(value.typ, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMediaTrack_lift(_ buf: RustBuffer) throws -> MediaTrack {
+    return try FfiConverterTypeMediaTrack.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMediaTrack_lower(_ value: MediaTrack) -> RustBuffer {
+    return FfiConverterTypeMediaTrack.lower(value)
+}
+
+
+public struct Metadata: Equatable, Hashable {
     public var title: String?
     public var thumbnailUrl: String?
 
@@ -2902,31 +4045,15 @@ public struct Metadata {
         self.title = title
         self.thumbnailUrl = thumbnailUrl
     }
+
+    
+
+    
 }
 
 #if compiler(>=6)
 extension Metadata: Sendable {}
 #endif
-
-
-extension Metadata: Equatable, Hashable {
-    public static func ==(lhs: Metadata, rhs: Metadata) -> Bool {
-        if lhs.title != rhs.title {
-            return false
-        }
-        if lhs.thumbnailUrl != rhs.thumbnailUrl {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(title)
-        hasher.combine(thumbnailUrl)
-    }
-}
-
-
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
@@ -2935,7 +4062,7 @@ public struct FfiConverterTypeMetadata: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Metadata {
         return
             try Metadata(
-                title: FfiConverterOptionString.read(from: &buf),
+                title: FfiConverterOptionString.read(from: &buf), 
                 thumbnailUrl: FfiConverterOptionString.read(from: &buf)
         )
     }
@@ -2962,7 +4089,7 @@ public func FfiConverterTypeMetadata_lower(_ value: Metadata) -> RustBuffer {
 }
 
 
-public struct PlaylistItem {
+public struct PlaylistItem: Equatable, Hashable {
     /**
      * MIME type
      */
@@ -2981,10 +4108,10 @@ public struct PlaylistItem {
     public init(
         /**
          * MIME type
-         */contentType: String,
+         */contentType: String, 
         /**
          * URL
-         */contentLocation: String,
+         */contentLocation: String, 
         /**
          * Seconds from beginning of media to start playback
          */startTime: Double?) {
@@ -2992,35 +4119,15 @@ public struct PlaylistItem {
         self.contentLocation = contentLocation
         self.startTime = startTime
     }
+
+    
+
+    
 }
 
 #if compiler(>=6)
 extension PlaylistItem: Sendable {}
 #endif
-
-
-extension PlaylistItem: Equatable, Hashable {
-    public static func ==(lhs: PlaylistItem, rhs: PlaylistItem) -> Bool {
-        if lhs.contentType != rhs.contentType {
-            return false
-        }
-        if lhs.contentLocation != rhs.contentLocation {
-            return false
-        }
-        if lhs.startTime != rhs.startTime {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(contentType)
-        hasher.combine(contentLocation)
-        hasher.combine(startTime)
-    }
-}
-
-
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
@@ -3029,8 +4136,8 @@ public struct FfiConverterTypePlaylistItem: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PlaylistItem {
         return
             try PlaylistItem(
-                contentType: FfiConverterString.read(from: &buf),
-                contentLocation: FfiConverterString.read(from: &buf),
+                contentType: FfiConverterString.read(from: &buf), 
+                contentLocation: FfiConverterString.read(from: &buf), 
                 startTime: FfiConverterOptionDouble.read(from: &buf)
         )
     }
@@ -3058,14 +4165,552 @@ public func FfiConverterTypePlaylistItem_lower(_ value: PlaylistItem) -> RustBuf
 }
 
 
-public enum AsyncRuntimeError: Swift.Error {
+/**
+ * A queue of media items to load and play. FCast v4 only.
+ */
+public struct Queue: Equatable, Hashable {
+    /**
+     * The items to enqueue (the receiver caps a queue at 256 items).
+     */
+    public var items: [QueueEntry]
+    /**
+     * Zero-based index of the item to start playing. Defaults to the first.
+     * Values past the end of `items` are clamped to the last item.
+     */
+    public var startIndex: UInt32?
+    /**
+     * Whether the receiver should automatically advance to the next item when
+     * the current one finishes.
+     */
+    public var autoplay: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The items to enqueue (the receiver caps a queue at 256 items).
+         */items: [QueueEntry], 
+        /**
+         * Zero-based index of the item to start playing. Defaults to the first.
+         * Values past the end of `items` are clamped to the last item.
+         */startIndex: UInt32?, 
+        /**
+         * Whether the receiver should automatically advance to the next item when
+         * the current one finishes.
+         */autoplay: Bool) {
+        self.items = items
+        self.startIndex = startIndex
+        self.autoplay = autoplay
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension Queue: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeQueue: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Queue {
+        return
+            try Queue(
+                items: FfiConverterSequenceTypeQueueEntry.read(from: &buf), 
+                startIndex: FfiConverterOptionUInt32.read(from: &buf), 
+                autoplay: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: Queue, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeQueueEntry.write(value.items, into: &buf)
+        FfiConverterOptionUInt32.write(value.startIndex, into: &buf)
+        FfiConverterBool.write(value.autoplay, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeQueue_lift(_ buf: RustBuffer) throws -> Queue {
+    return try FfiConverterTypeQueue.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeQueue_lower(_ value: Queue) -> RustBuffer {
+    return FfiConverterTypeQueue.lower(value)
+}
+
+
+/**
+ * One entry in a [`Queue`]: a media item plus optional playback duration.
+ */
+public struct QueueEntry: Equatable, Hashable {
+    public var item: MediaItem
+    /**
+     * How long to play this entry before advancing, in seconds. Intended for live/unbounded
+     * sources. `None` plays to the item's natural end. Non-finite or negative values are treated
+     * as `None`.
+     */
+    public var playbackDuration: Double?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(item: MediaItem, 
+        /**
+         * How long to play this entry before advancing, in seconds. Intended for live/unbounded
+         * sources. `None` plays to the item's natural end. Non-finite or negative values are treated
+         * as `None`.
+         */playbackDuration: Double?) {
+        self.item = item
+        self.playbackDuration = playbackDuration
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension QueueEntry: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeQueueEntry: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> QueueEntry {
+        return
+            try QueueEntry(
+                item: FfiConverterTypeMediaItem.read(from: &buf), 
+                playbackDuration: FfiConverterOptionDouble.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: QueueEntry, into buf: inout [UInt8]) {
+        FfiConverterTypeMediaItem.write(value.item, into: &buf)
+        FfiConverterOptionDouble.write(value.playbackDuration, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeQueueEntry_lift(_ buf: RustBuffer) throws -> QueueEntry {
+    return try FfiConverterTypeQueueEntry.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeQueueEntry_lower(_ value: QueueEntry) -> RustBuffer {
+    return FfiConverterTypeQueueEntry.lower(value)
+}
+
+
+/**
+ * The SDK's live mirror of the receiver's queue.
+ *
+ * Delivered to [`DeviceEventHandler::queue_changed`] whenever the queue changes (the initial load,
+ * an insertion, a removal, or a selection), regardless of whether this sender or another sender
+ * caused the change.  When the queue ends (playback stops or a single-item load replaces it), one
+ * final empty snapshot with no items is delivered.
+ *
+ * The SDK does not retain this for you: store the latest snapshot in your application if you need
+ * to read it back.
+ */
+public struct QueueState: Equatable, Hashable {
+    public var items: [QueueEntry]
+    /**
+     * Zero-based index of the currently playing item, if any.
+     */
+    public var currentIndex: UInt32?
+    public var autoplay: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(items: [QueueEntry], 
+        /**
+         * Zero-based index of the currently playing item, if any.
+         */currentIndex: UInt32?, autoplay: Bool) {
+        self.items = items
+        self.currentIndex = currentIndex
+        self.autoplay = autoplay
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension QueueState: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeQueueState: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> QueueState {
+        return
+            try QueueState(
+                items: FfiConverterSequenceTypeQueueEntry.read(from: &buf), 
+                currentIndex: FfiConverterOptionUInt32.read(from: &buf), 
+                autoplay: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: QueueState, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeQueueEntry.write(value.items, into: &buf)
+        FfiConverterOptionUInt32.write(value.currentIndex, into: &buf)
+        FfiConverterBool.write(value.autoplay, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeQueueState_lift(_ buf: RustBuffer) throws -> QueueState {
+    return try FfiConverterTypeQueueState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeQueueState_lower(_ value: QueueState) -> RustBuffer {
+    return FfiConverterTypeQueueState.lower(value)
+}
+
+
+/**
+ * Capabilities advertised by an FCast receiver in its v4 `ReceiverIntroduction`.
+ *
+ * Mirrors the `ReceiverCapabilities` flatbuffers table.
+ */
+public struct ReceiverCapabilities: Equatable, Hashable {
+    public var media: MediaCapabilities?
+    public var display: DisplayCapabilities?
+    public var audio: AudioCapabilities?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(media: MediaCapabilities?, display: DisplayCapabilities?, audio: AudioCapabilities?) {
+        self.media = media
+        self.display = display
+        self.audio = audio
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ReceiverCapabilities: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeReceiverCapabilities: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ReceiverCapabilities {
+        return
+            try ReceiverCapabilities(
+                media: FfiConverterOptionTypeMediaCapabilities.read(from: &buf), 
+                display: FfiConverterOptionTypeDisplayCapabilities.read(from: &buf), 
+                audio: FfiConverterOptionTypeAudioCapabilities.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ReceiverCapabilities, into buf: inout [UInt8]) {
+        FfiConverterOptionTypeMediaCapabilities.write(value.media, into: &buf)
+        FfiConverterOptionTypeDisplayCapabilities.write(value.display, into: &buf)
+        FfiConverterOptionTypeAudioCapabilities.write(value.audio, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeReceiverCapabilities_lift(_ buf: RustBuffer) throws -> ReceiverCapabilities {
+    return try FfiConverterTypeReceiverCapabilities.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeReceiverCapabilities_lower(_ value: ReceiverCapabilities) -> RustBuffer {
+    return FfiConverterTypeReceiverCapabilities.lower(value)
+}
+
+
+public struct ResourceInfo: Equatable, Hashable {
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init() {
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ResourceInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeResourceInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ResourceInfo {
+        return
+            ResourceInfo()
+    }
+
+    public static func write(_ value: ResourceInfo, into buf: inout [UInt8]) {
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeResourceInfo_lift(_ buf: RustBuffer) throws -> ResourceInfo {
+    return try FfiConverterTypeResourceInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeResourceInfo_lower(_ value: ResourceInfo) -> RustBuffer {
+    return FfiConverterTypeResourceInfo.lower(value)
+}
+
+
+/**
+ * An external subtitle track to attach to the current media. FCast v4 only.
+ */
+public struct SubtitleSource: Equatable, Hashable {
+    public var url: String
+    /**
+     * Whether the receiver should select this track immediately.
+     */
+    public var select: Bool
+    public var name: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(url: String, 
+        /**
+         * Whether the receiver should select this track immediately.
+         */select: Bool, name: String?) {
+        self.url = url
+        self.select = select
+        self.name = name
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SubtitleSource: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSubtitleSource: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SubtitleSource {
+        return
+            try SubtitleSource(
+                url: FfiConverterString.read(from: &buf), 
+                select: FfiConverterBool.read(from: &buf), 
+                name: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SubtitleSource, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.url, into: &buf)
+        FfiConverterBool.write(value.select, into: &buf)
+        FfiConverterOptionString.write(value.name, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSubtitleSource_lift(_ buf: RustBuffer) throws -> SubtitleSource {
+    return try FfiConverterTypeSubtitleSource.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSubtitleSource_lower(_ value: SubtitleSource) -> RustBuffer {
+    return FfiConverterTypeSubtitleSource.lower(value)
+}
+
+
+/**
+ * The available media tracks and the current selection per track type.
+ *
+ * Delivered to [`DeviceEventHandler::tracks_changed`]. A `None` selected id means that track type
+ * is currently disabled (or has no applicable track).
+ *
+ * The SDK does not retain this for you: store the latest snapshot in your application if you need
+ * to read it back.
+ */
+public struct TrackList: Equatable, Hashable {
+    public var tracks: [MediaTrack]
+    public var selectedVideo: UInt32?
+    public var selectedAudio: UInt32?
+    public var selectedSubtitle: UInt32?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(tracks: [MediaTrack], selectedVideo: UInt32?, selectedAudio: UInt32?, selectedSubtitle: UInt32?) {
+        self.tracks = tracks
+        self.selectedVideo = selectedVideo
+        self.selectedAudio = selectedAudio
+        self.selectedSubtitle = selectedSubtitle
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension TrackList: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTrackList: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TrackList {
+        return
+            try TrackList(
+                tracks: FfiConverterSequenceTypeMediaTrack.read(from: &buf), 
+                selectedVideo: FfiConverterOptionUInt32.read(from: &buf), 
+                selectedAudio: FfiConverterOptionUInt32.read(from: &buf), 
+                selectedSubtitle: FfiConverterOptionUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: TrackList, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeMediaTrack.write(value.tracks, into: &buf)
+        FfiConverterOptionUInt32.write(value.selectedVideo, into: &buf)
+        FfiConverterOptionUInt32.write(value.selectedAudio, into: &buf)
+        FfiConverterOptionUInt32.write(value.selectedSubtitle, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTrackList_lift(_ buf: RustBuffer) throws -> TrackList {
+    return try FfiConverterTypeTrackList.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTrackList_lower(_ value: TrackList) -> RustBuffer {
+    return FfiConverterTypeTrackList.lower(value)
+}
+
+
+public struct VideoResolution: Equatable, Hashable {
+    public var width: UInt32
+    public var height: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(width: UInt32, height: UInt32) {
+        self.width = width
+        self.height = height
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension VideoResolution: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeVideoResolution: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> VideoResolution {
+        return
+            try VideoResolution(
+                width: FfiConverterUInt32.read(from: &buf), 
+                height: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: VideoResolution, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.width, into: &buf)
+        FfiConverterUInt32.write(value.height, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVideoResolution_lift(_ buf: RustBuffer) throws -> VideoResolution {
+    return try FfiConverterTypeVideoResolution.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVideoResolution_lower(_ value: VideoResolution) -> RustBuffer {
+    return FfiConverterTypeVideoResolution.lower(value)
+}
+
+
+public enum AsyncRuntimeError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
 
     
     
     case FailedToBuild(message: String)
     
+
+    
+
+    
+
+    
+    public var errorDescription: String? {
+        String(reflecting: self)
+    }
+    
 }
 
+#if compiler(>=6)
+extension AsyncRuntimeError: Sendable {}
+#endif
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
@@ -3119,22 +4764,7 @@ public func FfiConverterTypeAsyncRuntimeError_lower(_ value: AsyncRuntimeError) 
 }
 
 
-extension AsyncRuntimeError: Equatable, Hashable {}
-
-
-
-
-extension AsyncRuntimeError: Foundation.LocalizedError {
-    public var errorDescription: String? {
-        String(reflecting: self)
-    }
-}
-
-
-
-
-
-public enum CastingDeviceError: Swift.Error {
+public enum CastingDeviceError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
 
     
     
@@ -3144,12 +4774,23 @@ public enum CastingDeviceError: Swift.Error {
     
     case DeviceAlreadyStarted(message: String)
     
-    case UnsupportedSubscription(message: String)
-    
     case UnsupportedFeature(message: String)
+    
+
+    
+
+    
+
+    
+    public var errorDescription: String? {
+        String(reflecting: self)
+    }
     
 }
 
+#if compiler(>=6)
+extension CastingDeviceError: Sendable {}
+#endif
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
@@ -3176,11 +4817,7 @@ public struct FfiConverterTypeCastingDeviceError: FfiConverterRustBuffer {
             message: try FfiConverterString.read(from: &buf)
         )
         
-        case 4: return .UnsupportedSubscription(
-            message: try FfiConverterString.read(from: &buf)
-        )
-        
-        case 5: return .UnsupportedFeature(
+        case 4: return .UnsupportedFeature(
             message: try FfiConverterString.read(from: &buf)
         )
         
@@ -3201,10 +4838,8 @@ public struct FfiConverterTypeCastingDeviceError: FfiConverterRustBuffer {
             writeInt(&buf, Int32(2))
         case .DeviceAlreadyStarted(_ /* message is ignored*/):
             writeInt(&buf, Int32(3))
-        case .UnsupportedSubscription(_ /* message is ignored*/):
-            writeInt(&buf, Int32(4))
         case .UnsupportedFeature(_ /* message is ignored*/):
-            writeInt(&buf, Int32(5))
+            writeInt(&buf, Int32(4))
 
         
         }
@@ -3226,33 +4861,119 @@ public func FfiConverterTypeCastingDeviceError_lower(_ value: CastingDeviceError
     return FfiConverterTypeCastingDeviceError.lower(value)
 }
 
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
-extension CastingDeviceError: Equatable, Hashable {}
+public enum CompanionSourceDescriptor: Equatable, Hashable {
+    
+    /**
+     * A local filesystem path the SDK opens for reading.
+     */
+    case path(String
+    )
+    /**
+     * An already-open file descriptor whose ownership is transferred to the SDK.
+     *
+     * Intended for platforms that hand apps a descriptor rather than a path (e.g. Android's
+     * Storage Access Framework, iOS document/photo pickers).  The caller must relinquish ownership
+     * first (Android: `ParcelFileDescriptor.detachFd()`), must not close or reuse it afterwards,
+     * and must not reference the same descriptor from a second source or load. The SDK closes it
+     * exactly once: when playback stops, the session ends, or the load that carried it
+     * fails. Reusing a descriptor that is still registered is rejected with an error. The SDK
+     * cannot detect reuse after it has closed the descriptor, so that remains the caller's
+     * responsibility.
+     *
+     * The variant exists on every platform so the generated foreign bindings are identical
+     * everywhere, but it is only usable on Unix targets. On other platforms a load carrying it
+     * fails.
+     */
+    case fd(Int32
+    )
 
 
 
 
-extension CastingDeviceError: Foundation.LocalizedError {
-    public var errorDescription: String? {
-        String(reflecting: self)
+
+}
+
+#if compiler(>=6)
+extension CompanionSourceDescriptor: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCompanionSourceDescriptor: FfiConverterRustBuffer {
+    typealias SwiftType = CompanionSourceDescriptor
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CompanionSourceDescriptor {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .path(try FfiConverterString.read(from: &buf)
+        )
+        
+        case 2: return .fd(try FfiConverterInt32.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CompanionSourceDescriptor, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .path(v1):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(v1, into: &buf)
+            
+        
+        case let .fd(v1):
+            writeInt(&buf, Int32(2))
+            FfiConverterInt32.write(v1, into: &buf)
+            
+        }
     }
 }
 
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCompanionSourceDescriptor_lift(_ buf: RustBuffer) throws -> CompanionSourceDescriptor {
+    return try FfiConverterTypeCompanionSourceDescriptor.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCompanionSourceDescriptor_lower(_ value: CompanionSourceDescriptor) -> RustBuffer {
+    return FfiConverterTypeCompanionSourceDescriptor.lower(value)
+}
 
 
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
-public enum DeviceConnectionState {
+public enum DeviceConnectionState: Equatable, Hashable {
     
     case disconnected
     case connecting
     case reconnecting
-    case connected(usedRemoteAddr: IpAddr, localAddr: IpAddr
+    case connected(usedRemoteAddr: IpAddr, localAddr: IpAddr, 
+        /**
+         * Formats and capabilities the receiver advertised in its v4
+         * introduction. `None` for protocols that don't provide this
+         * information (FCast v2/v3 and Chromecast).
+         */capabilities: ReceiverCapabilities?
     )
-}
 
+
+
+
+
+}
 
 #if compiler(>=6)
 extension DeviceConnectionState: Sendable {}
@@ -3274,7 +4995,7 @@ public struct FfiConverterTypeDeviceConnectionState: FfiConverterRustBuffer {
         
         case 3: return .reconnecting
         
-        case 4: return .connected(usedRemoteAddr: try FfiConverterTypeIpAddr.read(from: &buf), localAddr: try FfiConverterTypeIpAddr.read(from: &buf)
+        case 4: return .connected(usedRemoteAddr: try FfiConverterTypeIpAddr.read(from: &buf), localAddr: try FfiConverterTypeIpAddr.read(from: &buf), capabilities: try FfiConverterOptionTypeReceiverCapabilities.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -3297,10 +5018,11 @@ public struct FfiConverterTypeDeviceConnectionState: FfiConverterRustBuffer {
             writeInt(&buf, Int32(3))
         
         
-        case let .connected(usedRemoteAddr,localAddr):
+        case let .connected(usedRemoteAddr,localAddr,capabilities):
             writeInt(&buf, Int32(4))
             FfiConverterTypeIpAddr.write(usedRemoteAddr, into: &buf)
             FfiConverterTypeIpAddr.write(localAddr, into: &buf)
+            FfiConverterOptionTypeReceiverCapabilities.write(capabilities, into: &buf)
             
         }
     }
@@ -3322,30 +5044,31 @@ public func FfiConverterTypeDeviceConnectionState_lower(_ value: DeviceConnectio
 }
 
 
-extension DeviceConnectionState: Equatable, Hashable {}
-
-
-
-
-
-
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
-public enum DeviceFeature {
+public enum DeviceFeature: Equatable, Hashable {
     
     case setVolume
     case setSpeed
     case loadContent
     case loadUrl
-    case keyEventSubscription
-    case mediaEventSubscription
     case loadImage
     case loadPlaylist
     case playlistNextAndPrevious
     case setPlaylistItemIndex
-}
+    case whepStreaming
+    case fCompanion
+    case fwrtcSignalling
+    case changeTrack
+    case queue
+    case setProgressUpdateInterval
 
+
+
+
+
+}
 
 #if compiler(>=6)
 extension DeviceFeature: Sendable {}
@@ -3369,17 +5092,25 @@ public struct FfiConverterTypeDeviceFeature: FfiConverterRustBuffer {
         
         case 4: return .loadUrl
         
-        case 5: return .keyEventSubscription
+        case 5: return .loadImage
         
-        case 6: return .mediaEventSubscription
+        case 6: return .loadPlaylist
         
-        case 7: return .loadImage
+        case 7: return .playlistNextAndPrevious
         
-        case 8: return .loadPlaylist
+        case 8: return .setPlaylistItemIndex
         
-        case 9: return .playlistNextAndPrevious
+        case 9: return .whepStreaming
         
-        case 10: return .setPlaylistItemIndex
+        case 10: return .fCompanion
+        
+        case 11: return .fwrtcSignalling
+        
+        case 12: return .changeTrack
+        
+        case 13: return .queue
+        
+        case 14: return .setProgressUpdateInterval
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -3405,28 +5136,44 @@ public struct FfiConverterTypeDeviceFeature: FfiConverterRustBuffer {
             writeInt(&buf, Int32(4))
         
         
-        case .keyEventSubscription:
+        case .loadImage:
             writeInt(&buf, Int32(5))
         
         
-        case .mediaEventSubscription:
+        case .loadPlaylist:
             writeInt(&buf, Int32(6))
         
         
-        case .loadImage:
+        case .playlistNextAndPrevious:
             writeInt(&buf, Int32(7))
         
         
-        case .loadPlaylist:
+        case .setPlaylistItemIndex:
             writeInt(&buf, Int32(8))
         
         
-        case .playlistNextAndPrevious:
+        case .whepStreaming:
             writeInt(&buf, Int32(9))
         
         
-        case .setPlaylistItemIndex:
+        case .fCompanion:
             writeInt(&buf, Int32(10))
+        
+        
+        case .fwrtcSignalling:
+            writeInt(&buf, Int32(11))
+        
+        
+        case .changeTrack:
+            writeInt(&buf, Int32(12))
+        
+        
+        case .queue:
+            writeInt(&buf, Int32(13))
+        
+        
+        case .setProgressUpdateInterval:
+            writeInt(&buf, Int32(14))
         
         }
     }
@@ -3448,247 +5195,21 @@ public func FfiConverterTypeDeviceFeature_lower(_ value: DeviceFeature) -> RustB
 }
 
 
-extension DeviceFeature: Equatable, Hashable {}
-
-
-
-
-
-
-
-public enum FileServerError: Swift.Error {
-
-    
-    
-    case NotRunning(message: String)
-    
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeFileServerError: FfiConverterRustBuffer {
-    typealias SwiftType = FileServerError
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FileServerError {
-        let variant: Int32 = try readInt(&buf)
-        switch variant {
-
-        
-
-        
-        case 1: return .NotRunning(
-            message: try FfiConverterString.read(from: &buf)
-        )
-        
-
-        default: throw UniffiInternalError.unexpectedEnumCase
-        }
-    }
-
-    public static func write(_ value: FileServerError, into buf: inout [UInt8]) {
-        switch value {
-
-        
-
-        
-        case .NotRunning(_ /* message is ignored*/):
-            writeInt(&buf, Int32(1))
-
-        
-        }
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeFileServerError_lift(_ buf: RustBuffer) throws -> FileServerError {
-    return try FfiConverterTypeFileServerError.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeFileServerError_lower(_ value: FileServerError) -> RustBuffer {
-    return FfiConverterTypeFileServerError.lower(value)
-}
-
-
-extension FileServerError: Equatable, Hashable {}
-
-
-
-
-extension FileServerError: Foundation.LocalizedError {
-    public var errorDescription: String? {
-        String(reflecting: self)
-    }
-}
-
-
-
-
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
-public enum GenericEventSubscriptionGroup {
-    
-    case keys
-    case media
-}
-
-
-#if compiler(>=6)
-extension GenericEventSubscriptionGroup: Sendable {}
-#endif
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeGenericEventSubscriptionGroup: FfiConverterRustBuffer {
-    typealias SwiftType = GenericEventSubscriptionGroup
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> GenericEventSubscriptionGroup {
-        let variant: Int32 = try readInt(&buf)
-        switch variant {
-        
-        case 1: return .keys
-        
-        case 2: return .media
-        
-        default: throw UniffiInternalError.unexpectedEnumCase
-        }
-    }
-
-    public static func write(_ value: GenericEventSubscriptionGroup, into buf: inout [UInt8]) {
-        switch value {
-        
-        
-        case .keys:
-            writeInt(&buf, Int32(1))
-        
-        
-        case .media:
-            writeInt(&buf, Int32(2))
-        
-        }
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeGenericEventSubscriptionGroup_lift(_ buf: RustBuffer) throws -> GenericEventSubscriptionGroup {
-    return try FfiConverterTypeGenericEventSubscriptionGroup.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeGenericEventSubscriptionGroup_lower(_ value: GenericEventSubscriptionGroup) -> RustBuffer {
-    return FfiConverterTypeGenericEventSubscriptionGroup.lower(value)
-}
-
-
-extension GenericEventSubscriptionGroup: Equatable, Hashable {}
-
-
-
-
-
-
-// Note that we don't yet support `indirect` for enums.
-// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
-
-public enum GenericMediaEvent {
-    
-    case started
-    case ended
-    case changed
-}
-
-
-#if compiler(>=6)
-extension GenericMediaEvent: Sendable {}
-#endif
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeGenericMediaEvent: FfiConverterRustBuffer {
-    typealias SwiftType = GenericMediaEvent
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> GenericMediaEvent {
-        let variant: Int32 = try readInt(&buf)
-        switch variant {
-        
-        case 1: return .started
-        
-        case 2: return .ended
-        
-        case 3: return .changed
-        
-        default: throw UniffiInternalError.unexpectedEnumCase
-        }
-    }
-
-    public static func write(_ value: GenericMediaEvent, into buf: inout [UInt8]) {
-        switch value {
-        
-        
-        case .started:
-            writeInt(&buf, Int32(1))
-        
-        
-        case .ended:
-            writeInt(&buf, Int32(2))
-        
-        
-        case .changed:
-            writeInt(&buf, Int32(3))
-        
-        }
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeGenericMediaEvent_lift(_ buf: RustBuffer) throws -> GenericMediaEvent {
-    return try FfiConverterTypeGenericMediaEvent.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeGenericMediaEvent_lower(_ value: GenericMediaEvent) -> RustBuffer {
-    return FfiConverterTypeGenericMediaEvent.lower(value)
-}
-
-
-extension GenericMediaEvent: Equatable, Hashable {}
-
-
-
-
-
-
-// Note that we don't yet support `indirect` for enums.
-// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
-
-public enum IpAddr {
+public enum IpAddr: Equatable, Hashable {
     
     case v4(o1: UInt8, o2: UInt8, o3: UInt8, o4: UInt8
     )
     case v6(o1: UInt8, o2: UInt8, o3: UInt8, o4: UInt8, o5: UInt8, o6: UInt8, o7: UInt8, o8: UInt8, o9: UInt8, o10: UInt8, o11: UInt8, o12: UInt8, o13: UInt8, o14: UInt8, o15: UInt8, o16: UInt8, scopeId: UInt32
     )
-}
 
+
+
+
+
+}
 
 #if compiler(>=6)
 extension IpAddr: Sendable {}
@@ -3766,30 +5287,35 @@ public func FfiConverterTypeIpAddr_lower(_ value: IpAddr) -> RustBuffer {
 }
 
 
-extension IpAddr: Equatable, Hashable {}
-
-
-
-
-
-
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
-public enum LoadRequest {
+public enum LoadRequest: Equatable, Hashable {
     
-    case url(contentType: String, url: String, resumePosition: Double? = nil, speed: Double? = nil, volume: Double? = nil, metadata: Metadata? = nil, requestHeaders: [String: String]? = nil
+    case url(contentType: String, url: String, resumePosition: Double?, speed: Double?, volume: Double?, metadata: Metadata?, requestHeaders: [String: String]?
     )
-    case content(contentType: String, content: String, resumePosition: Double = Double(0), speed: Double? = nil, volume: Double? = nil, metadata: Metadata? = nil, requestHeaders: [String: String]? = nil
+    /**
+     * Load content, usually a [DASH](https://en.wikipedia.org/wiki/Dynamic_Adaptive_Streaming_over_HTTP) or
+     * [HLS](https://en.wikipedia.org/wiki/HTTP_Live_Streaming) manifest.
+     */
+    case content(contentType: String, content: String, resumePosition: Double, speed: Double?, volume: Double?, metadata: Metadata?, requestHeaders: [String: String]?
     )
-    case video(contentType: String, url: String, resumePosition: Double = Double(0), speed: Double? = nil, volume: Double? = nil, metadata: Metadata? = nil, requestHeaders: [String: String]? = nil
+    case video(contentType: String, url: String, resumePosition: Double, speed: Double?, volume: Double?, metadata: Metadata?, requestHeaders: [String: String]?
     )
-    case image(contentType: String, url: String, metadata: Metadata? = nil, requestHeaders: [String: String]? = nil
+    case image(contentType: String, url: String, metadata: Metadata?, requestHeaders: [String: String]?
     )
     case playlist(items: [PlaylistItem]
     )
-}
+    case companionResource(contentType: String, source: CompanionSource, resumePosition: Double?, speed: Double?, volume: Double?, metadata: Metadata?
+    )
+    case queue(items: [QueueItem], startIndex: UInt8?
+    )
 
+
+
+
+
+}
 
 #if compiler(>=6)
 extension LoadRequest: Sendable {}
@@ -3818,6 +5344,12 @@ public struct FfiConverterTypeLoadRequest: FfiConverterRustBuffer {
         )
         
         case 5: return .playlist(items: try FfiConverterSequenceTypePlaylistItem.read(from: &buf)
+        )
+        
+        case 6: return .companionResource(contentType: try FfiConverterString.read(from: &buf), source: try FfiConverterTypeCompanionSource.read(from: &buf), resumePosition: try FfiConverterOptionDouble.read(from: &buf), speed: try FfiConverterOptionDouble.read(from: &buf), volume: try FfiConverterOptionDouble.read(from: &buf), metadata: try FfiConverterOptionTypeMetadata.read(from: &buf)
+        )
+        
+        case 7: return .queue(items: try FfiConverterSequenceTypeQueueItem.read(from: &buf), startIndex: try FfiConverterOptionUInt8.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -3873,6 +5405,22 @@ public struct FfiConverterTypeLoadRequest: FfiConverterRustBuffer {
             writeInt(&buf, Int32(5))
             FfiConverterSequenceTypePlaylistItem.write(items, into: &buf)
             
+        
+        case let .companionResource(contentType,source,resumePosition,speed,volume,metadata):
+            writeInt(&buf, Int32(6))
+            FfiConverterString.write(contentType, into: &buf)
+            FfiConverterTypeCompanionSource.write(source, into: &buf)
+            FfiConverterOptionDouble.write(resumePosition, into: &buf)
+            FfiConverterOptionDouble.write(speed, into: &buf)
+            FfiConverterOptionDouble.write(volume, into: &buf)
+            FfiConverterOptionTypeMetadata.write(metadata, into: &buf)
+            
+        
+        case let .queue(items,startIndex):
+            writeInt(&buf, Int32(7))
+            FfiConverterSequenceTypeQueueItem.write(items, into: &buf)
+            FfiConverterOptionUInt8.write(startIndex, into: &buf)
+            
         }
     }
 }
@@ -3893,22 +5441,19 @@ public func FfiConverterTypeLoadRequest_lower(_ value: LoadRequest) -> RustBuffe
 }
 
 
-extension LoadRequest: Equatable, Hashable {}
-
-
-
-
-
-
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
-public enum LogLevelFilter {
+public enum LogLevelFilter: Equatable, Hashable {
     
     case debug
     case info
-}
 
+
+
+
+
+}
 
 #if compiler(>=6)
 extension LogLevelFilter: Sendable {}
@@ -3963,22 +5508,181 @@ public func FfiConverterTypeLogLevelFilter_lower(_ value: LogLevelFilter) -> Rus
 }
 
 
-extension LogLevelFilter: Equatable, Hashable {}
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Where a [`MediaItem`] is fetched from.
+ */
+
+public enum MediaLocator: Equatable, Hashable {
+    
+    case url(url: String
+    )
+    /**
+     * A locally-served resource delivered over the FCast companion channel.
+     */
+    case fCompanion(source: CompanionSource
+    )
 
 
 
 
 
+}
+
+#if compiler(>=6)
+extension MediaLocator: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMediaLocator: FfiConverterRustBuffer {
+    typealias SwiftType = MediaLocator
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MediaLocator {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .url(url: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 2: return .fCompanion(source: try FfiConverterTypeCompanionSource.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: MediaLocator, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .url(url):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(url, into: &buf)
+            
+        
+        case let .fCompanion(source):
+            writeInt(&buf, Int32(2))
+            FfiConverterTypeCompanionSource.write(source, into: &buf)
+            
+        }
+    }
+}
 
 
-public enum ParseIpAddrError: Swift.Error {
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMediaLocator_lift(_ buf: RustBuffer) throws -> MediaLocator {
+    return try FfiConverterTypeMediaLocator.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMediaLocator_lower(_ value: MediaLocator) -> RustBuffer {
+    return FfiConverterTypeMediaLocator.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum MediaTrackType: Equatable, Hashable {
+    
+    case video
+    case audio
+    case subtitle
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension MediaTrackType: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMediaTrackType: FfiConverterRustBuffer {
+    typealias SwiftType = MediaTrackType
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MediaTrackType {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .video
+        
+        case 2: return .audio
+        
+        case 3: return .subtitle
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: MediaTrackType, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .video:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .audio:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .subtitle:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMediaTrackType_lift(_ buf: RustBuffer) throws -> MediaTrackType {
+    return try FfiConverterTypeMediaTrackType.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMediaTrackType_lower(_ value: MediaTrackType) -> RustBuffer {
+    return FfiConverterTypeMediaTrackType.lower(value)
+}
+
+
+
+public enum ParseIpAddrError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
 
     
     
     case FailedToParse(message: String)
     
+
+    
+
+    
+
+    
+    public var errorDescription: String? {
+        String(reflecting: self)
+    }
+    
 }
 
+#if compiler(>=6)
+extension ParseIpAddrError: Sendable {}
+#endif
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
@@ -4031,32 +5735,30 @@ public func FfiConverterTypeParseIpAddrError_lower(_ value: ParseIpAddrError) ->
     return FfiConverterTypeParseIpAddrError.lower(value)
 }
 
-
-extension ParseIpAddrError: Equatable, Hashable {}
-
-
-
-
-extension ParseIpAddrError: Foundation.LocalizedError {
-    public var errorDescription: String? {
-        String(reflecting: self)
-    }
-}
-
-
-
-
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
-public enum PlaybackState {
+public enum PlaybackState: Equatable, Hashable {
     
     case idle
     case buffering
     case playing
     case paused
-}
+    /**
+     * The media item played through to its natural end.
+     *
+     * This is distinct from being *stopped*: an item that is explicitly
+     * terminated before reaching its end does not produce `Ended` but instead
+     * triggers [`DeviceEventHandler::playback_stopped`]. See that method for
+     * the full ended-vs-stopped breakdown.
+     */
+    case ended
 
+
+
+
+
+}
 
 #if compiler(>=6)
 extension PlaybackState: Sendable {}
@@ -4079,6 +5781,8 @@ public struct FfiConverterTypePlaybackState: FfiConverterRustBuffer {
         case 3: return .playing
         
         case 4: return .paused
+        
+        case 5: return .ended
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -4103,6 +5807,10 @@ public struct FfiConverterTypePlaybackState: FfiConverterRustBuffer {
         case .paused:
             writeInt(&buf, Int32(4))
         
+        
+        case .ended:
+            writeInt(&buf, Int32(5))
+        
         }
     }
 }
@@ -4123,22 +5831,19 @@ public func FfiConverterTypePlaybackState_lower(_ value: PlaybackState) -> RustB
 }
 
 
-extension PlaybackState: Equatable, Hashable {}
-
-
-
-
-
-
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
-public enum ProtocolType {
+public enum ProtocolType: Equatable, Hashable {
     
     case chromecast
     case fCast
-}
 
+
+
+
+
+}
 
 #if compiler(>=6)
 extension ProtocolType: Sendable {}
@@ -4193,27 +5898,357 @@ public func FfiConverterTypeProtocolType_lower(_ value: ProtocolType) -> RustBuf
 }
 
 
-extension ProtocolType: Equatable, Hashable {}
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum QueueItem: Equatable, Hashable {
+    
+    case url(url: String, contentType: String, metadata: Metadata?, requestHeaders: [String: String]?
+    )
+    case fCompanion(contentType: String, source: CompanionSource, metadata: Metadata?
+    )
 
 
 
 
+
+}
+
+#if compiler(>=6)
+extension QueueItem: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeQueueItem: FfiConverterRustBuffer {
+    typealias SwiftType = QueueItem
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> QueueItem {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .url(url: try FfiConverterString.read(from: &buf), contentType: try FfiConverterString.read(from: &buf), metadata: try FfiConverterOptionTypeMetadata.read(from: &buf), requestHeaders: try FfiConverterOptionDictionaryStringString.read(from: &buf)
+        )
+        
+        case 2: return .fCompanion(contentType: try FfiConverterString.read(from: &buf), source: try FfiConverterTypeCompanionSource.read(from: &buf), metadata: try FfiConverterOptionTypeMetadata.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: QueueItem, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .url(url,contentType,metadata,requestHeaders):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(url, into: &buf)
+            FfiConverterString.write(contentType, into: &buf)
+            FfiConverterOptionTypeMetadata.write(metadata, into: &buf)
+            FfiConverterOptionDictionaryStringString.write(requestHeaders, into: &buf)
+            
+        
+        case let .fCompanion(contentType,source,metadata):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(contentType, into: &buf)
+            FfiConverterTypeCompanionSource.write(source, into: &buf)
+            FfiConverterOptionTypeMetadata.write(metadata, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeQueueItem_lift(_ buf: RustBuffer) throws -> QueueItem {
+    return try FfiConverterTypeQueueItem.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeQueueItem_lower(_ value: QueueItem) -> RustBuffer {
+    return FfiConverterTypeQueueItem.lower(value)
+}
 
 
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
-public enum Source {
+public enum QueuePosition: Equatable, Hashable {
     
-    case url(url: String,
+    case front
+    case back
+    case index(UInt8
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension QueuePosition: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeQueuePosition: FfiConverterRustBuffer {
+    typealias SwiftType = QueuePosition
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> QueuePosition {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .front
+        
+        case 2: return .back
+        
+        case 3: return .index(try FfiConverterUInt8.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: QueuePosition, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .front:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .back:
+            writeInt(&buf, Int32(2))
+        
+        
+        case let .index(v1):
+            writeInt(&buf, Int32(3))
+            FfiConverterUInt8.write(v1, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeQueuePosition_lift(_ buf: RustBuffer) throws -> QueuePosition {
+    return try FfiConverterTypeQueuePosition.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeQueuePosition_lower(_ value: QueuePosition) -> RustBuffer {
+    return FfiConverterTypeQueuePosition.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * An error the receiver reported in response to a command this sender issued (FCast v4
+ * `Error`). Mirrors the protocol's `ErrorKind`.
+ */
+
+public enum ReceiverError: Equatable, Hashable {
+    
+    case invalidOpcode
+    case resourceNotFound
+    /**
+     * A seek was clamped to a valid range.
+     */
+    case seekOutOfRange
+    /**
+     * A volume was clamped to a valid range.
+     */
+    case volumeOutOfRange
+    /**
+     * A rate was clamped to a valid range.
+     */
+    case rateOutOfRange
+    case unsupportedFormat
+    case malformedBody
+    /**
+     * The command cannot be handled in the receiver's current state.
+     */
+    case invalidState
+    case queuePositionOutOfRange
+    case queueRemovePlayingItem
+    case queueFull
+    case invalidPayloadType
+    /**
+     * An opaque internal receiver error.
+     */
+    case `internal`
+    /**
+     * An error kind not known to this version of the SDK.
+     */
+    case unknown
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension ReceiverError: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeReceiverError: FfiConverterRustBuffer {
+    typealias SwiftType = ReceiverError
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ReceiverError {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .invalidOpcode
+        
+        case 2: return .resourceNotFound
+        
+        case 3: return .seekOutOfRange
+        
+        case 4: return .volumeOutOfRange
+        
+        case 5: return .rateOutOfRange
+        
+        case 6: return .unsupportedFormat
+        
+        case 7: return .malformedBody
+        
+        case 8: return .invalidState
+        
+        case 9: return .queuePositionOutOfRange
+        
+        case 10: return .queueRemovePlayingItem
+        
+        case 11: return .queueFull
+        
+        case 12: return .invalidPayloadType
+        
+        case 13: return .`internal`
+        
+        case 14: return .unknown
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ReceiverError, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .invalidOpcode:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .resourceNotFound:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .seekOutOfRange:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .volumeOutOfRange:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .rateOutOfRange:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .unsupportedFormat:
+            writeInt(&buf, Int32(6))
+        
+        
+        case .malformedBody:
+            writeInt(&buf, Int32(7))
+        
+        
+        case .invalidState:
+            writeInt(&buf, Int32(8))
+        
+        
+        case .queuePositionOutOfRange:
+            writeInt(&buf, Int32(9))
+        
+        
+        case .queueRemovePlayingItem:
+            writeInt(&buf, Int32(10))
+        
+        
+        case .queueFull:
+            writeInt(&buf, Int32(11))
+        
+        
+        case .invalidPayloadType:
+            writeInt(&buf, Int32(12))
+        
+        
+        case .`internal`:
+            writeInt(&buf, Int32(13))
+        
+        
+        case .unknown:
+            writeInt(&buf, Int32(14))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeReceiverError_lift(_ buf: RustBuffer) throws -> ReceiverError {
+    return try FfiConverterTypeReceiverError.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeReceiverError_lower(_ value: ReceiverError) -> RustBuffer {
+    return FfiConverterTypeReceiverError.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum Source: Equatable, Hashable {
+    
+    case url(url: String, 
         /**
          * MIME content type
          */contentType: String
     )
     case content(content: String
     )
-}
+    case companionResource(id: UInt32, 
+        /**
+         * MIME content type
+         */contentType: String
+    )
 
+
+
+
+
+}
 
 #if compiler(>=6)
 extension Source: Sendable {}
@@ -4235,6 +6270,9 @@ public struct FfiConverterTypeSource: FfiConverterRustBuffer {
         case 2: return .content(content: try FfiConverterString.read(from: &buf)
         )
         
+        case 3: return .companionResource(id: try FfiConverterUInt32.read(from: &buf), contentType: try FfiConverterString.read(from: &buf)
+        )
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -4252,6 +6290,12 @@ public struct FfiConverterTypeSource: FfiConverterRustBuffer {
         case let .content(content):
             writeInt(&buf, Int32(2))
             FfiConverterString.write(content, into: &buf)
+            
+        
+        case let .companionResource(id,contentType):
+            writeInt(&buf, Int32(3))
+            FfiConverterUInt32.write(id, into: &buf)
+            FfiConverterString.write(contentType, into: &buf)
             
         }
     }
@@ -4273,12 +6317,77 @@ public func FfiConverterTypeSource_lower(_ value: Source) -> RustBuffer {
 }
 
 
-extension Source: Equatable, Hashable {}
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionUInt8: FfiConverterRustBuffer {
+    typealias SwiftType = UInt8?
 
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterUInt8.write(value, into: &buf)
+    }
 
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterUInt8.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionUInt32: FfiConverterRustBuffer {
+    typealias SwiftType = UInt32?
 
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterUInt32.write(value, into: &buf)
+    }
 
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterUInt32.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionUInt64: FfiConverterRustBuffer {
+    typealias SwiftType = UInt64?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterUInt64.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterUInt64.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
@@ -4355,6 +6464,30 @@ fileprivate struct FfiConverterOptionTypeApplicationInfo: FfiConverterRustBuffer
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeAudioCapabilities: FfiConverterRustBuffer {
+    typealias SwiftType = AudioCapabilities?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeAudioCapabilities.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeAudioCapabilities.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeDeviceInfo: FfiConverterRustBuffer {
     typealias SwiftType = DeviceInfo?
 
@@ -4371,6 +6504,54 @@ fileprivate struct FfiConverterOptionTypeDeviceInfo: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeDeviceInfo.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeDisplayCapabilities: FfiConverterRustBuffer {
+    typealias SwiftType = DisplayCapabilities?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeDisplayCapabilities.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeDisplayCapabilities.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeMediaCapabilities: FfiConverterRustBuffer {
+    typealias SwiftType = MediaCapabilities?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeMediaCapabilities.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeMediaCapabilities.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -4403,6 +6584,54 @@ fileprivate struct FfiConverterOptionTypeMetadata: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeReceiverCapabilities: FfiConverterRustBuffer {
+    typealias SwiftType = ReceiverCapabilities?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeReceiverCapabilities.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeReceiverCapabilities.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeVideoResolution: FfiConverterRustBuffer {
+    typealias SwiftType = VideoResolution?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeVideoResolution.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeVideoResolution.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionDictionaryStringString: FfiConverterRustBuffer {
     typealias SwiftType = [String: String]?
 
@@ -4427,6 +6656,56 @@ fileprivate struct FfiConverterOptionDictionaryStringString: FfiConverterRustBuf
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
+    typealias SwiftType = [String]
+
+    public static func write(_ value: [String], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterString.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [String] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [String]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterString.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeMediaTrack: FfiConverterRustBuffer {
+    typealias SwiftType = [MediaTrack]
+
+    public static func write(_ value: [MediaTrack], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeMediaTrack.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [MediaTrack] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [MediaTrack]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeMediaTrack.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypePlaylistItem: FfiConverterRustBuffer {
     typealias SwiftType = [PlaylistItem]
 
@@ -4444,6 +6723,31 @@ fileprivate struct FfiConverterSequenceTypePlaylistItem: FfiConverterRustBuffer 
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypePlaylistItem.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeQueueEntry: FfiConverterRustBuffer {
+    typealias SwiftType = [QueueEntry]
+
+    public static func write(_ value: [QueueEntry], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeQueueEntry.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [QueueEntry] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [QueueEntry]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeQueueEntry.read(from: &buf))
         }
         return seq
     }
@@ -4477,6 +6781,31 @@ fileprivate struct FfiConverterSequenceTypeIpAddr: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeQueueItem: FfiConverterRustBuffer {
+    typealias SwiftType = [QueueItem]
+
+    public static func write(_ value: [QueueItem], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeQueueItem.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [QueueItem] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [QueueItem]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeQueueItem.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterDictionaryStringString: FfiConverterRustBuffer {
     public static func write(_ value: [String: String], into buf: inout [UInt8]) {
         let len = Int32(value.count)
@@ -4498,13 +6827,6 @@ fileprivate struct FfiConverterDictionaryStringString: FfiConverterRustBuffer {
         }
         return dict
     }
-}
-public func deviceInfoFromUrl(url: String) -> DeviceInfo?  {
-    return try!  FfiConverterOptionTypeDeviceInfo.lift(try! rustCall() {
-    uniffi_fcast_sender_sdk_fn_func_device_info_from_url(
-        FfiConverterString.lower(url),$0
-    )
-})
 }
 public func initLogger(levelFilter: LogLevelFilter)  {try! rustCall() {
     uniffi_fcast_sender_sdk_fn_func_init_logger(
@@ -4533,6 +6855,16 @@ public func urlFormatIpAddr(addr: IpAddr) -> String  {
     )
 })
 }
+/**
+ * Attempt to retrieve device info from a URL.
+ */
+public func deviceInfoFromUrl(url: String) -> DeviceInfo?  {
+    return try!  FfiConverterOptionTypeDeviceInfo.lift(try! rustCall() {
+    uniffi_fcast_sender_sdk_fn_func_device_info_from_url(
+        FfiConverterString.lower(url),$0
+    )
+})
+}
 
 private enum InitializationResult {
     case ok
@@ -4549,9 +6881,6 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_func_device_info_from_url() != 25669) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_fcast_sender_sdk_checksum_func_init_logger() != 31351) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -4564,276 +6893,358 @@ private let initializationResult: InitializationResult = {
     if (uniffi_fcast_sender_sdk_checksum_func_url_format_ip_addr() != 18869) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_castcontext_create_device_from_info() != 54863) {
+    if (uniffi_fcast_sender_sdk_checksum_func_device_info_from_url() != 13204) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_castcontext_start_file_server() != 34584) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_casting_protocol() != 2830) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_is_ready() != 51243) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_supports_feature() != 19075) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_name() != 52342) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_set_name() != 33400) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_seek() != 18061) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_stop_playback() != 9008) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_pause_playback() != 64656) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_resume_playback() != 31503) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_load() != 25431) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_playlist_item_next() != 27623) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_playlist_item_previous() != 46547) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_set_playlist_item_index() != 7913) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_change_volume() != 29640) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_change_speed() != 58484) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_disconnect() != 1946) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_connect() != 38396) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_get_device_info() != 2341) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_get_addresses() != 56902) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_set_addresses() != 8588) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_get_port() != 38625) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_set_port() != 32694) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_subscribe_event() != 30010) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_unsubscribe_event() != 25900) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_casting_protocol() != 60157) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_change_speed() != 21973) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_change_volume() != 33973) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_connect() != 12899) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_disconnect() != 59227) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_get_addresses() != 14832) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_get_device_info() != 12169) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_get_port() != 33210) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_is_ready() != 11146) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_load() != 44533) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_name() != 54720) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_pause_playback() != 26354) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_playlist_item_next() != 17628) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_playlist_item_previous() != 38695) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_resume_playback() != 51067) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_seek() != 38009) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_set_addresses() != 48530) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_set_name() != 32193) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_set_playlist_item_index() != 44859) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_set_port() != 25285) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_stop_playback() != 24364) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_subscribe_event() != 42722) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_supports_feature() != 1972) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_unsubscribe_event() != 59444) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_fcast_sender_sdk_checksum_method_devicediscoverereventhandler_device_available() != 1229) {
+    if (uniffi_fcast_sender_sdk_checksum_method_devicediscoverereventhandler_device_available() != 9944) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_fcast_sender_sdk_checksum_method_devicediscoverereventhandler_device_removed() != 5064) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_devicediscoverereventhandler_device_changed() != 57172) {
+    if (uniffi_fcast_sender_sdk_checksum_method_devicediscoverereventhandler_device_changed() != 51123) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_deviceeventhandler_connection_state_changed() != 52409) {
+    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_add_subtitle_source() != 3887) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_deviceeventhandler_volume_changed() != 63365) {
+    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_casting_protocol() != 45271) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_deviceeventhandler_time_changed() != 17761) {
+    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_change_speed() != 7380) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_deviceeventhandler_playback_state_changed() != 24439) {
+    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_change_track() != 63240) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_deviceeventhandler_duration_changed() != 65176) {
+    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_change_volume() != 36454) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_deviceeventhandler_speed_changed() != 46207) {
+    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_connect() != 24580) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_deviceeventhandler_source_changed() != 43278) {
+    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_disconnect() != 15566) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_deviceeventhandler_key_event() != 22046) {
+    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_get_addresses() != 52472) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_deviceeventhandler_media_event() != 39470) {
+    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_get_device_info() != 54090) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_deviceeventhandler_playback_error() != 24999) {
+    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_get_port() != 44835) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_casting_protocol() != 41425) {
+    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_is_ready() != 42228) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_change_speed() != 7390) {
+    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_load() != 21521) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_change_volume() != 36255) {
+    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_load_queue() != 9914) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_connect() != 55339) {
+    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_name() != 6463) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_disconnect() != 21243) {
+    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_pause_playback() != 17960) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_get_addresses() != 26248) {
+    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_playlist_item_next() != 32427) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_get_device_info() != 42623) {
+    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_playlist_item_previous() != 14093) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_get_port() != 56818) {
+    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_queue_add() != 13389) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_is_ready() != 36453) {
+    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_queue_insert() != 10186) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_load() != 60447) {
+    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_queue_remove() != 56519) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_name() != 48649) {
+    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_queue_select() != 25314) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_pause_playback() != 42235) {
+    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_resume_playback() != 33087) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_playlist_item_next() != 13000) {
+    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_seek() != 58505) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_playlist_item_previous() != 13472) {
+    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_set_addresses() != 49716) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_resume_playback() != 38825) {
+    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_set_name() != 24381) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_seek() != 61557) {
+    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_set_playlist_item_index() != 23230) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_set_addresses() != 14189) {
+    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_set_port() != 65070) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_set_name() != 1336) {
+    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_set_progress_update_interval() != 43404) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_set_playlist_item_index() != 739) {
+    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_start_mirroring_session() != 45198) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_set_port() != 11239) {
+    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_stop_playback() != 44394) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_stop_playback() != 42468) {
+    if (uniffi_fcast_sender_sdk_checksum_method_chromecastdevice_supports_feature() != 62029) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_subscribe_event() != 16526) {
+    if (uniffi_fcast_sender_sdk_checksum_method_castcontext_create_device_from_info() != 3012) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_supports_feature() != 55204) {
+    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_casting_protocol() != 7553) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_unsubscribe_event() != 37165) {
+    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_is_ready() != 23614) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_method_fileserver_serve_file() != 12813) {
+    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_supports_feature() != 11972) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_fcast_sender_sdk_checksum_constructor_castcontext_new() != 11681) {
+    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_name() != 34274) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_set_name() != 35703) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_seek() != 48162) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_stop_playback() != 52532) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_pause_playback() != 17590) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_resume_playback() != 31296) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_load() != 64756) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_playlist_item_next() != 43755) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_playlist_item_previous() != 42299) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_set_playlist_item_index() != 6078) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_change_volume() != 37442) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_change_speed() != 43043) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_disconnect() != 61313) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_connect() != 5683) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_get_device_info() != 49725) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_get_addresses() != 19361) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_set_addresses() != 51730) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_get_port() != 12636) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_set_port() != 28102) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_start_mirroring_session() != 47730) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_change_track() != 2260) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_queue_remove() != 7725) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_queue_add() != 2215) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_queue_select() != 16690) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_load_queue() != 22252) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_queue_insert() != 34348) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_add_subtitle_source() != 15778) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_castingdevice_set_progress_update_interval() != 35965) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_deviceeventhandler_connection_state_changed() != 25324) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_deviceeventhandler_volume_changed() != 26041) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_deviceeventhandler_time_changed() != 34675) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_deviceeventhandler_playback_state_changed() != 47359) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_deviceeventhandler_duration_changed() != 17710) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_deviceeventhandler_speed_changed() != 37818) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_deviceeventhandler_source_changed() != 62272) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_deviceeventhandler_playback_stopped() != 41635) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_deviceeventhandler_playback_error() != 57942) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_deviceeventhandler_tracks_available() != 20141) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_deviceeventhandler_track_selected() != 19415) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_deviceeventhandler_tracks_changed() != 28384) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_deviceeventhandler_queue_changed() != 43528) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_deviceeventhandler_command_error() != 32325) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_fwrtcsignaller_set_offer_sink() != 52569) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_fwrtcsignaller_on_answer_received() != 5264) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_mirroringoffersink_send_offer() != 10783) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_add_subtitle_source() != 27693) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_casting_protocol() != 20786) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_change_speed() != 26834) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_change_track() != 54163) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_change_volume() != 14912) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_connect() != 51711) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_disconnect() != 62208) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_get_addresses() != 52805) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_get_device_info() != 48644) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_get_port() != 63503) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_is_ready() != 54279) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_load() != 20640) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_load_queue() != 42611) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_name() != 22709) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_pause_playback() != 35357) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_playlist_item_next() != 37873) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_playlist_item_previous() != 19287) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_queue_add() != 4792) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_queue_insert() != 34908) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_queue_remove() != 15570) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_queue_select() != 27189) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_resume_playback() != 62964) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_seek() != 4285) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_set_addresses() != 20533) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_set_name() != 16561) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_set_playlist_item_index() != 4405) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_set_port() != 58523) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_set_progress_update_interval() != 40163) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_start_mirroring_session() != 39126) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_stop_playback() != 11173) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_method_fcastdevice_supports_feature() != 51652) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_fcast_sender_sdk_checksum_constructor_castcontext_new() != 49104) {
         return InitializationResult.apiChecksumMismatch
     }
 
     uniffiCallbackInitDeviceDiscovererEventHandler()
     uniffiCallbackInitDeviceEventHandler()
+    uniffiCallbackInitFWRTCSignaller()
     return InitializationResult.ok
 }()
 

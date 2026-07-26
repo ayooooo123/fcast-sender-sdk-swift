@@ -1,7 +1,12 @@
+import argparse
 import json
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.source_pin import (
     EXPECTED_CARGO_PACKAGE,
@@ -12,6 +17,7 @@ from scripts.source_pin import (
     EXPECTED_RUST_TOOLCHAIN,
     EXPECTED_TAG,
     SourcePin,
+    SourcePinError,
 )
 
 
@@ -268,6 +274,56 @@ def serialize_json(payload: object) -> str:
     )
 
 
+def render_build_inputs(source_pin, environment):
+    _validate_source_pin(source_pin)
+    _validate_environment(environment)
+    fields = (
+        source_pin.repository,
+        source_pin.tag,
+        source_pin.commit,
+        source_pin.rust_toolchain,
+        ",".join(source_pin.rust_targets),
+        source_pin.cargo_package,
+        environment.runner,
+        environment.xcode_version,
+        environment.xcode_build_version,
+        environment.swift_version,
+        environment.swift_language_revision,
+        environment.rust_version,
+        environment.zip_version,
+    )
+    if any("\t" in field or "\n" in field or "\r" in field for field in fields):
+        raise ReleaseMetadataError(
+            "build inputs must not contain tab or newline characters"
+        )
+    return "\t".join(fields) + "\n"
+
+
+def render_build_metadata(source_pin, environment, source_date_epoch):
+    _validate_source_pin(source_pin)
+    _validate_environment(environment)
+    if type(source_date_epoch) is not int or source_date_epoch < 0:
+        raise ReleaseMetadataError(
+            "source date epoch must be a non-negative JSON integer"
+        )
+    return serialize_json(
+        {
+            "buildEnvironment": environment.as_lock_payload(),
+            "cargoPackage": source_pin.cargo_package,
+            "features": list(source_pin.features),
+            "rustTargets": list(source_pin.rust_targets),
+            "schemaVersion": 1,
+            "source": {
+                "commit": source_pin.commit,
+                "repository": source_pin.repository,
+                "tag": source_pin.tag,
+            },
+            "sourceDateEpoch": source_date_epoch,
+            "sourcePatched": False,
+        }
+    )
+
+
 def _reject_duplicate_object_keys(pairs):
     parsed = {}
     for key, value in pairs:
@@ -381,3 +437,53 @@ def _require_exact_value(actual, expected, path):
         raise ReleaseMetadataError(
             f"{path} disagrees with the release locks; expected {expected}"
         )
+
+
+def _build_parser():
+    parser = argparse.ArgumentParser()
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    package = commands.add_parser("render-package")
+    package.add_argument("--version", required=True)
+    package.add_argument("--checksum", required=True)
+    package.add_argument("--output", required=True)
+
+    inputs = commands.add_parser("build-inputs")
+    inputs.add_argument("--source-lock", required=True)
+    inputs.add_argument("--environment-lock", required=True)
+
+    metadata = commands.add_parser("render-build-metadata")
+    metadata.add_argument("--source-lock", required=True)
+    metadata.add_argument("--environment-lock", required=True)
+    metadata.add_argument("--source-date-epoch", required=True, type=int)
+    metadata.add_argument("--output", required=True)
+    return parser
+
+
+def main(argv=None):
+    arguments = _build_parser().parse_args(argv)
+    try:
+        if arguments.command == "render-package":
+            rendered = render_package(arguments.version, arguments.checksum)
+            Path(arguments.output).write_text(rendered, encoding="utf-8")
+        elif arguments.command == "build-inputs":
+            source_pin = SourcePin.load(arguments.source_lock)
+            environment = BuildEnvironment.load(arguments.environment_lock)
+            sys.stdout.write(render_build_inputs(source_pin, environment))
+        else:
+            source_pin = SourcePin.load(arguments.source_lock)
+            environment = BuildEnvironment.load(arguments.environment_lock)
+            rendered = render_build_metadata(
+                source_pin,
+                environment,
+                arguments.source_date_epoch,
+            )
+            Path(arguments.output).write_text(rendered, encoding="utf-8")
+    except (OSError, SourcePinError, ReleaseMetadataError) as error:
+        print(f"release metadata error: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
