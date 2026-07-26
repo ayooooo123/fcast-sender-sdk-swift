@@ -42,6 +42,22 @@ for this evidence task.
 - Installed pinned targets:
   `aarch64-apple-ios`, `aarch64-apple-ios-sim`
 
+Version evidence was collected with these exact commands:
+
+```text
+env RUSTUP_TOOLCHAIN=1.96.1 rustc --version --verbose
+exit 0
+
+env RUSTUP_TOOLCHAIN=1.96.1 cargo --version --verbose
+exit 0
+
+xcodebuild -version
+exit 0
+
+swift --version
+exit 0
+```
+
 ## Checkout commands
 
 The first toolchain metadata request ended with a transient TLS handshake EOF
@@ -106,8 +122,22 @@ It had two transport-only attempts before reaching compilation:
 - exit 101 with `CARGO_NET_GIT_FETCH_WITH_CLI=true`: crates.io transfers
   exhausted Cargo's default low-speed retries while fetching `askama`.
 
-The same command with Cargo's Git CLI and transport-tolerant HTTP settings
-reached compilation, then exited 101 with:
+The complete compile-reaching command with Cargo's Git CLI and
+transport-tolerant HTTP settings was:
+
+```text
+env RUSTUP_TOOLCHAIN=1.96.1 \
+  CARGO_NET_GIT_FETCH_WITH_CLI=true \
+  CARGO_HTTP_TIMEOUT=600 \
+  CARGO_HTTP_LOW_SPEED_LIMIT=1 \
+  CARGO_NET_RETRY=5 \
+  cargo test --manifest-path source/Cargo.toml \
+  -p fcast-sender-sdk --locked \
+  --no-default-features --features _ios_defaults
+exit 101
+```
+
+It reached compilation, then failed with:
 
 ```text
 error[E0599]: no method named `spawn` found for enum `AsyncRuntime`
@@ -199,6 +229,20 @@ test -f ios-bindings/uniffi/module.modulemap
 ```
 
 Observed sizes and SHA-256 hashes:
+
+```text
+wc -c \
+  ios-bindings/uniffi/fcast_sender_sdk.swift \
+  ios-bindings/uniffi/fcast_sender_sdkFFI.h \
+  ios-bindings/uniffi/module.modulemap
+exit 0
+
+shasum -a 256 \
+  ios-bindings/uniffi/fcast_sender_sdk.swift \
+  ios-bindings/uniffi/fcast_sender_sdkFFI.h \
+  ios-bindings/uniffi/module.modulemap
+exit 0
+```
 
 ```text
 237253 ios-bindings/uniffi/fcast_sender_sdk.swift
