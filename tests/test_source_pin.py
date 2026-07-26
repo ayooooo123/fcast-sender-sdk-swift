@@ -39,6 +39,22 @@ class SourcePinTests(unittest.TestCase):
             with self.assertRaisesRegex(SourcePinError, message_pattern):
                 SourcePin.load(path)
 
+    def assert_invalid_raw(self, raw_json, message_pattern):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "source.lock.json"
+            path.write_text(raw_json, encoding="utf-8")
+            try:
+                SourcePin.load(path)
+            except SourcePinError as error:
+                self.assertRegex(str(error), message_pattern)
+            except Exception as error:
+                self.fail(
+                    "expected SourcePinError, "
+                    f"got {type(error).__name__}: {error}"
+                )
+            else:
+                self.fail("expected SourcePinError to be raised")
+
     def test_loads_checked_in_lock_with_normalized_immutable_properties(self):
         source_pin = SourcePin.load(CHECKED_IN_LOCK)
 
@@ -69,6 +85,20 @@ class SourcePinTests(unittest.TestCase):
 
             with self.assertRaisesRegex(SourcePinError, "valid JSON"):
                 SourcePin.load(path)
+
+    def test_rejects_duplicate_authority_key_in_raw_json(self):
+        raw_json = json.dumps(valid_payload()).replace(
+            '"repository": ',
+            (
+                '"repository": "https://attacker.invalid/fcast.git", '
+                '"repository": '
+            ),
+            1,
+        )
+        self.assert_invalid_raw(
+            raw_json,
+            "duplicate JSON object key.*repository",
+        )
 
     def test_rejects_non_object_root(self):
         self.assert_invalid([], "JSON object")
@@ -179,6 +209,16 @@ class SourcePinTests(unittest.TestCase):
             "https://gitlab.futo.org/videostreaming/fcast.git/"
         )
         self.assert_invalid(payload, "repository.*path")
+
+    def test_rejects_malformed_repository_url_with_source_pin_error(self):
+        payload = valid_payload()
+        payload["repository"] = (
+            "https://[invalid/videostreaming/fcast.git"
+        )
+        self.assert_invalid_raw(
+            json.dumps(payload),
+            "repository.*valid URL",
+        )
 
     def test_rejects_empty_tag(self):
         payload = valid_payload()

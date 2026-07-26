@@ -46,7 +46,10 @@ class SourcePin:
     def load(cls, path):
         lock_path = Path(path)
         try:
-            payload = json.loads(lock_path.read_text(encoding="utf-8"))
+            payload = json.loads(
+                lock_path.read_text(encoding="utf-8"),
+                object_pairs_hook=_reject_duplicate_object_keys,
+            )
         except json.JSONDecodeError as error:
             raise SourcePinError(
                 f"{lock_path} must contain valid JSON: {error.msg}"
@@ -136,13 +139,33 @@ def _require_type(payload, key, expected_type, type_name):
         raise SourcePinError(f"{key} must be a JSON {type_name}")
 
 
+def _reject_duplicate_object_keys(pairs):
+    parsed_object = {}
+    for key, value in pairs:
+        if key in parsed_object:
+            raise SourcePinError(
+                f"duplicate JSON object key is not allowed: {key}"
+            )
+        parsed_object[key] = value
+    return parsed_object
+
+
 def _validate_repository(repository):
-    parsed = urlsplit(repository)
+    try:
+        parsed = urlsplit(repository)
+        username = parsed.username
+        password = parsed.password
+        hostname = parsed.hostname
+    except ValueError as error:
+        raise SourcePinError(
+            f"repository must be a valid URL: {error}"
+        ) from error
+
     if parsed.scheme != "https":
         raise SourcePinError("repository must use HTTPS")
-    if parsed.username is not None or parsed.password is not None:
+    if username is not None or password is not None:
         raise SourcePinError("repository must not contain credentials")
-    if parsed.hostname != "gitlab.futo.org":
+    if hostname != "gitlab.futo.org":
         raise SourcePinError("repository host must be exactly gitlab.futo.org")
     if parsed.query:
         raise SourcePinError("repository must not contain a query")
