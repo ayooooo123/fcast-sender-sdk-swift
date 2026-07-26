@@ -28,6 +28,26 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          required_tools=(
+            python3
+            sudo
+            xcode-select
+            xcodebuild
+            swift
+            sw_vers
+            /usr/bin/zip
+            rustup
+            shasum
+            awk
+            cmp
+          )
+          for required_tool in "${required_tools[@]}"; do
+            if ! command -v "$required_tool" >/dev/null; then
+              printf 'required CI tool is unavailable: %s\n' "$required_tool" >&2
+              exit 1
+            fi
+          done
+
           python3 - <<'PY'
           import json
           from pathlib import Path
@@ -78,117 +98,6 @@ jobs:
           RUST_OUTPUT="$(rustup run 1.96.1 rustc --version)"
           [[ "$RUST_OUTPUT" == "rustc 1.96.1 ("* ]]
 
-      - name: Reject mutable package references
-        shell: bash
-        run: |
-          set -euo pipefail
-          if rg -n '(gitlab\.futo\.org/.*/jobs/.*/artifacts|/latest/|releases/latest|branch[[:space:]]*:|from[[:space:]]*:|\.package\([^)]*from[[:space:]]*:|/(main|master|branches|raw)/)' Package.swift; then
-            echo "Package.swift contains a mutable package reference" >&2
-            exit 1
-          fi
-          python3 - <<'PY'
-          import re
-          import sys
-          from pathlib import Path
-
-          def strip_comments(source):
-              output = []
-              index = 0
-              state = "code"
-              block_depth = 0
-              while index < len(source):
-                  pair = source[index:index + 2]
-                  character = source[index]
-                  if state == "code":
-                      if pair == "//":
-                          output.extend((" ", " "))
-                          index += 2
-                          state = "line-comment"
-                      elif pair == "/*":
-                          output.extend((" ", " "))
-                          index += 2
-                          state = "block-comment"
-                          block_depth = 1
-                      else:
-                          output.append(character)
-                          index += 1
-                          if character == '"':
-                              state = "string"
-                  elif state == "string":
-                      output.append(character)
-                      index += 1
-                      if character == "\\" and index < len(source):
-                          output.append(source[index])
-                          index += 1
-                      elif character == '"':
-                          state = "code"
-                  elif state == "line-comment":
-                      output.append("\n" if character == "\n" else " ")
-                      index += 1
-                      if character == "\n":
-                          state = "code"
-                  else:
-                      if pair == "/*":
-                          output.extend((" ", " "))
-                          index += 2
-                          block_depth += 1
-                      elif pair == "*/":
-                          output.extend((" ", " "))
-                          index += 2
-                          block_depth -= 1
-                          if block_depth == 0:
-                              state = "code"
-                      else:
-                          output.append("\n" if character == "\n" else " ")
-                          index += 1
-              if state in ("string", "block-comment"):
-                  raise SystemExit("Package.swift contains an unterminated token")
-              return "".join(output)
-
-          manifest = Path("Package.swift").read_text(encoding="utf-8")
-          code = strip_comments(manifest)
-          url_token = re.compile(r"""https?://[^\s"'<>]+""")
-          allowed_url = re.compile(
-              r"https://github\.com/ayooooo123/fcast-sender-sdk-swift/"
-              r"releases/download/"
-              r"[0-9]+\.[0-9]+\.[0-9]+"
-              r"(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?/"
-              r"fcast_sender_sdk\.xcframework\.zip"
-          )
-          declaration = re.compile(
-              r'(?m)^[ \t]*let[ \t]+url[ \t]*=[ \t]*'
-              r'"([^"\\\r\n]+)"[ \t]*$'
-          )
-          binary_binding = re.compile(
-              r'(?m)^[ \t]*\.binaryTarget\([ \t]*'
-              r'name:[ \t]*"fcast_sender_sdkFFI",[ \t]*'
-              r'url:[ \t]*url,[ \t]*'
-              r'checksum:[ \t]*checksum[ \t]*\),[ \t]*$'
-          )
-
-          declarations = declaration.findall(code)
-          binary_calls = re.findall(r"\.binaryTarget[ \t]*\(", code)
-          binary_bindings = binary_binding.findall(code)
-          url_identifiers = re.findall(r"\burl\b", code)
-          urls = url_token.findall(code)
-          binding_is_canonical = (
-              len(declarations) == 1
-              and len(binary_calls) == 1
-              and len(binary_bindings) == 1
-              and len(url_identifiers) == 3
-              and len(urls) == 1
-              and urls[0] == declarations[0]
-              and allowed_url.fullmatch(declarations[0]) is not None
-          )
-          if not binding_is_canonical:
-              print(
-                  "Package.swift violates the canonical binaryTarget URL "
-                  "binding to exactly one immutable versioned release asset URL",
-                  file=sys.stderr,
-              )
-              raise SystemExit(1)
-          PY
-
       - name: Test scripts and reproduce distribution
         shell: bash
         run: |
@@ -212,6 +121,69 @@ jobs:
           [[ "$ARCHIVE_SHA_1" == "$ARCHIVE_SHA_2" ]]
           [[ "$ARCHIVE_SHA_1" == "$SWIFTPM_CHECKSUM_1" ]]
           [[ "$ARCHIVE_SHA_2" == "$SWIFTPM_CHECKSUM_2" ]]
+
+          export REBUILT_SWIFTPM_CHECKSUM="$SWIFTPM_CHECKSUM_1"
+          DECLARED_PACKAGE_CHECKSUM="$(
+            python3 - <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+
+          from scripts.release_metadata import render_package
+
+          version = "0.0.8-mediastorm.1"
+          rebuilt_checksum = os.environ["REBUILT_SWIFTPM_CHECKSUM"]
+          expected = render_package(version, rebuilt_checksum).encode("utf-8")
+          actual = Path("Package.swift").read_bytes()
+          if actual != expected:
+              print(
+                  "Package.swift must exactly match the canonical generated "
+                  "manifest for the fixed release version and rebuilt archive "
+                  "checksum",
+                  file=sys.stderr,
+              )
+              raise SystemExit(1)
+          print(rebuilt_checksum)
+          PY
+          )"
+          [[ "$ARCHIVE_SHA_1" == "$DECLARED_PACKAGE_CHECKSUM" ]]
+
+          swift package --disable-sandbox dump-package \
+            > .build/ci-package-dump.json
+          export DECLARED_PACKAGE_CHECKSUM
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          from scripts.release_metadata import release_url
+
+          version = "0.0.8-mediastorm.1"
+          payload = json.loads(
+              Path(".build/ci-package-dump.json").read_text(encoding="utf-8")
+          )
+          targets = [
+              target
+              for target in payload.get("targets", [])
+              if target.get("name") == "fcast_sender_sdkFFI"
+          ]
+          valid = (
+              len(targets) == 1
+              and targets[0].get("type") == "binary"
+              and targets[0].get("url") == release_url(version)
+              and targets[0].get("checksum")
+              == os.environ["DECLARED_PACKAGE_CHECKSUM"]
+          )
+          if not valid:
+              print(
+                  "SwiftPM package semantics do not match the canonical "
+                  "binary target URL and checksum",
+                  file=sys.stderr,
+              )
+              raise SystemExit(1)
+          PY
+
           printf 'archive sha256: %s\nSwiftPM checksum: %s\n' \
             "$ARCHIVE_SHA_1" "$SWIFTPM_CHECKSUM_1"
 

