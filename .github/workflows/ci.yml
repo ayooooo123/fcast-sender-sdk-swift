@@ -86,14 +86,29 @@ jobs:
             echo "Package.swift contains a mutable package reference" >&2
             exit 1
           fi
-          if ! rg -n 'https://github\.com/ayooooo123/fcast-sender-sdk-swift/releases/download/[0-9]+\.[0-9]+\.[0-9]+[-.0-9A-Za-z]*/fcast_sender_sdk\.xcframework\.zip' Package.swift; then
-            echo "Package.swift does not contain the immutable versioned asset URL" >&2
-            exit 1
-          fi
-          if rg -n 'https?://[^"]+' Package.swift | rg -v 'https://github\.com/ayooooo123/fcast-sender-sdk-swift/releases/download/[0-9]+\.[0-9]+\.[0-9]+[-.0-9A-Za-z]*/fcast_sender_sdk\.xcframework\.zip'; then
-            echo "Package.swift contains a non-versioned URL" >&2
-            exit 1
-          fi
+          python3 - <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          manifest = Path("Package.swift").read_text(encoding="utf-8")
+          url_token = re.compile(r"""https?://[^\s"'<>]+""")
+          allowed_url = re.compile(
+              r"https://github\.com/ayooooo123/fcast-sender-sdk-swift/"
+              r"releases/download/"
+              r"[0-9]+\.[0-9]+\.[0-9]+"
+              r"(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?/"
+              r"fcast_sender_sdk\.xcframework\.zip"
+          )
+          urls = url_token.findall(manifest)
+          if len(urls) != 1 or allowed_url.fullmatch(urls[0]) is None:
+              print(
+                  "Package.swift must contain exactly one immutable versioned "
+                  "release asset URL",
+                  file=sys.stderr,
+              )
+              raise SystemExit(1)
+          PY
 
       - name: Test scripts and reproduce distribution
         shell: bash

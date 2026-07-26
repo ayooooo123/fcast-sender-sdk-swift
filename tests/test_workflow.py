@@ -1,4 +1,8 @@
 import re
+import subprocess
+import sys
+import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -38,12 +42,52 @@ def active_step_text(text, name):
     )
 
 
-def action_references(text):
-    return re.findall(r"(?m)^\s*(?:-\s*)?uses:\s*(\S+)\s*$", text)
+def manifest_validator_script(text):
+    block = named_step(text, "Reject mutable package references")
+    matches = re.findall(
+        r"(?ms)^[ \t]+python3 - <<'PY'\n(.*?)^[ \t]+PY[ \t]*$",
+        block,
+    )
+    if len(matches) != 1:
+        raise AssertionError("expected exactly one manifest validator heredoc")
+    return textwrap.dedent(matches[0])
+
+
+def run_manifest_validator(text, manifest):
+    script = manifest_validator_script(text)
+    with tempfile.TemporaryDirectory() as directory:
+        (Path(directory) / "Package.swift").write_text(
+            manifest,
+            encoding="utf-8",
+        )
+        return subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=directory,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+
+def action_declarations(text):
+    action_key = re.compile(
+        r"""(?x)(?:"uses"|'uses'|(?<![0-9A-Za-z_-])uses)\s*:"""
+    )
+    explicit_action_key = re.compile(
+        r"""(?x)^\s*(?:-\s*)?\?\s*(?:"uses"|'uses'|uses)\s*$"""
+    )
+    return [
+        line.strip()
+        for line in text.splitlines()
+        if action_key.search(line) or explicit_action_key.search(line)
+    ]
 
 
 def assert_safe_actions(test, text):
-    test.assertEqual(action_references(text), [f"actions/checkout@{CHECKOUT_SHA}"])
+    test.assertEqual(
+        action_declarations(text),
+        [f"uses: actions/checkout@{CHECKOUT_SHA}"],
+    )
     checkout = named_step(text, "Check out event commit")
     test.assertIn(f"uses: actions/checkout@{CHECKOUT_SHA}", checkout)
     test.assertRegex(checkout, r"(?m)^\s+persist-credentials:\s*false\s*$")
@@ -123,10 +167,12 @@ def assert_mutable_manifest_scan(test, text):
         "releases/latest",
         "branch[[:space:]]*:",
         "\\.package\\([^)]*from[[:space:]]*:",
-        "if ! rg -n",
-        "/releases/download/",
-        "if rg -n 'https?://",
-        "| rg -v",
+        "python3 - <<'PY'",
+        "url_token.findall(manifest)",
+        "allowed_url.fullmatch(urls[0])",
+        "releases/download/",
+        "fcast_sender_sdk\\.xcframework\\.zip",
+        "exactly one immutable versioned",
         "exit 1",
     )
     for fragment in required:
@@ -265,6 +311,31 @@ class WorkflowPolicyTests(unittest.TestCase):
                 "      - uses: actions/setup-python@v5",
                 1,
             ),
+            text.replace(
+                f"uses: actions/checkout@{CHECKOUT_SHA}",
+                f"uses: actions/checkout@{CHECKOUT_SHA}\n"
+                '      - "uses": owner/dangerous-action@v1',
+                1,
+            ),
+            text.replace(
+                f"uses: actions/checkout@{CHECKOUT_SHA}",
+                f"uses: actions/checkout@{CHECKOUT_SHA}\n"
+                "      - 'uses': 'owner/dangerous-action@v1'",
+                1,
+            ),
+            text.replace(
+                f"uses: actions/checkout@{CHECKOUT_SHA}",
+                f"uses: actions/checkout@{CHECKOUT_SHA}\n"
+                "      - {uses: owner/dangerous-action@v1}",
+                1,
+            ),
+            text.replace(
+                f"uses: actions/checkout@{CHECKOUT_SHA}",
+                f"uses: actions/checkout@{CHECKOUT_SHA}\n"
+                '      - ? "uses"\n'
+                "        : owner/dangerous-action@v1",
+                1,
+            ),
         )
         for mutation in mutations:
             with self.subTest(mutation=mutation[:120]):
@@ -316,6 +387,30 @@ class WorkflowPolicyTests(unittest.TestCase):
     def test_manifest_scan_rejects_all_mutable_reference_classes(self):
         assert_mutable_manifest_scan(self, workflow_text())
 
+    def test_manifest_validator_accepts_only_the_exact_url_token(self):
+        text = workflow_text()
+        manifest = (REPOSITORY_ROOT / "Package.swift").read_text(encoding="utf-8")
+        result = run_manifest_validator(text, manifest)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_manifest_validator_rejects_suffix_and_same_line_bypasses(self):
+        text = workflow_text()
+        manifest = (REPOSITORY_ROOT / "Package.swift").read_text(encoding="utf-8")
+        url = re.search(r'https://[^"]+', manifest).group(0)
+        bypasses = (
+            manifest.replace(f'{url}"', f'{url}.evil"', 1),
+            manifest.replace(
+                f'let url = "{url}"',
+                f'let url = "{url}", fallback = "https://evil.example/payload.zip"',
+                1,
+            ),
+        )
+        for bypass in bypasses:
+            with self.subTest(bypass=bypass.splitlines()[4]):
+                result = run_manifest_validator(text, bypass)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("immutable versioned release asset URL", result.stderr)
+
     def test_manifest_scan_policy_mutations_are_rejected(self):
         text = workflow_text()
         for fragment in (
@@ -325,10 +420,11 @@ class WorkflowPolicyTests(unittest.TestCase):
             "releases/latest",
             "branch[[:space:]]*:",
             "\\.package\\([^)]*from[[:space:]]*:",
-            "if ! rg -n",
-            "/releases/download/",
-            "if rg -n 'https?://",
-            "| rg -v",
+            "python3 - <<'PY'",
+            "url_token.findall(manifest)",
+            "allowed_url.fullmatch(urls[0])",
+            "releases/download/",
+            "fcast_sender_sdk\\.xcframework\\.zip",
         ):
             with self.subTest(fragment=fragment):
                 mutation = text.replace(fragment, "")
