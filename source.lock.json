@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "repository": "https://gitlab.futo.org/videostreaming/fcast.git",
+  "tag": "sender-sdk-v0.5.0",
+  "commit": "ce3c44c44b4057d3ba050696d9d0baa3e72b46f8",
+  "rustToolchain": "1.96.1",
+  "rustTargets": [
+    "aarch64-apple-ios",
+    "aarch64-apple-ios-sim"
+  ],
+  "cargoPackage": "fcast-sender-sdk",
+  "features": [
+    "_ios_defaults"
+  ]
+}
