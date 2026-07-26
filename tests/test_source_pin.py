@@ -98,6 +98,29 @@ class SourcePinTests(unittest.TestCase):
         payload["rustTargets"] = "aarch64-apple-ios"
         self.assert_invalid(payload, "rustTargets.*array")
 
+    def test_rejects_wrong_type_for_each_string_field(self):
+        for field in (
+            "repository",
+            "tag",
+            "commit",
+            "rustToolchain",
+            "cargoPackage",
+        ):
+            with self.subTest(field=field):
+                payload = valid_payload()
+                payload[field] = 7
+                self.assert_invalid(payload, f"{field}.*JSON string")
+
+    def test_rejects_non_string_rust_target_member(self):
+        payload = valid_payload()
+        payload["rustTargets"][1] = 7
+        self.assert_invalid(payload, r"rustTargets\[1\].*JSON string")
+
+    def test_rejects_non_string_feature_member(self):
+        payload = valid_payload()
+        payload["features"][0] = 7
+        self.assert_invalid(payload, r"features\[0\].*JSON string")
+
     def test_rejects_non_https_repository(self):
         payload = valid_payload()
         payload["repository"] = "http://gitlab.futo.org/videostreaming/fcast.git"
@@ -177,6 +200,11 @@ class SourcePinTests(unittest.TestCase):
         payload["tag"] = "sender-sdk-v0.5.0 "
         self.assert_invalid(payload, "tag.*whitespace")
 
+    def test_rejects_syntactically_valid_but_wrong_tag(self):
+        payload = valid_payload()
+        payload["tag"] = "sender-sdk-v0.5.1"
+        self.assert_invalid(payload, "tag.*exactly.*sender-sdk-v0\\.5\\.0")
+
     def test_rejects_short_commit(self):
         payload = valid_payload()
         payload["commit"] = "ce3c44c"
@@ -191,6 +219,14 @@ class SourcePinTests(unittest.TestCase):
         payload = valid_payload()
         payload["commit"] = "g" * 40
         self.assert_invalid(payload, "commit.*hex")
+
+    def test_rejects_valid_lowercase_hex_but_wrong_commit(self):
+        payload = valid_payload()
+        payload["commit"] = "0" * 40
+        self.assert_invalid(
+            payload,
+            "commit.*exactly.*ce3c44c44b4057d3ba050696d9d0baa3e72b46f8",
+        )
 
     def test_rejects_wrong_rust_toolchain(self):
         payload = valid_payload()
