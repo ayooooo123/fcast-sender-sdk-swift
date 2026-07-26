@@ -95,7 +95,7 @@ def action_declarations(text):
     )
     alternate_yaml_mechanism = re.compile(
         r"""(?x)(?:\\|^\s*(?:-\s*)?\?|"""
-        r"""(?:^|[\s{,])[&*][A-Za-z_]|<<:|!!|^\s*%)"""
+        r"""(?:^|[\s\[{,])[&*][^\s\[\]{},]+|<<:|!!|^\s*%)"""
     )
     return [
         line.strip()
@@ -372,6 +372,20 @@ class WorkflowPolicyTests(unittest.TestCase):
                 "x-action-key: &action-key uses\n"
                 f"        uses: actions/checkout@{CHECKOUT_SHA}\n"
                 "      - *action-key: owner/dangerous-action@v1",
+                1,
+            ),
+            text.replace(
+                f"uses: actions/checkout@{CHECKOUT_SHA}",
+                "x-action-key: &1 uses\n"
+                f"        uses: actions/checkout@{CHECKOUT_SHA}\n"
+                "      - *1: owner/dangerous-action@v1",
+                1,
+            ),
+            text.replace(
+                f"uses: actions/checkout@{CHECKOUT_SHA}",
+                "x-action-key: &9-anchor uses\n"
+                f"        uses: actions/checkout@{CHECKOUT_SHA}\n"
+                "      - *9-anchor: owner/dangerous-action@v1",
                 1,
             ),
             text.replace(
