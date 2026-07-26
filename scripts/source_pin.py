@@ -50,9 +50,11 @@ class SourcePin:
                 lock_path.read_text(encoding="utf-8"),
                 object_pairs_hook=_reject_duplicate_object_keys,
             )
-        except json.JSONDecodeError as error:
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            detail = getattr(error, "msg", str(error))
             raise SourcePinError(
-                f"{lock_path} must contain valid JSON: {error.msg}"
+                f"{lock_path} must contain valid JSON encoded as UTF-8: "
+                f"{detail}"
             ) from error
         except OSError as error:
             raise SourcePinError(f"unable to read source pin {lock_path}: {error}") from error

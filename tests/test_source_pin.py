@@ -86,6 +86,22 @@ class SourcePinTests(unittest.TestCase):
             with self.assertRaisesRegex(SourcePinError, "valid JSON"):
                 SourcePin.load(path)
 
+    def test_rejects_invalid_utf8_with_source_pin_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "source.lock.json"
+            path.write_bytes(b"\xff")
+            try:
+                SourcePin.load(path)
+            except SourcePinError as error:
+                self.assertRegex(str(error), "UTF-8|source pin")
+            except Exception as error:
+                self.fail(
+                    "expected SourcePinError, "
+                    f"got {type(error).__name__}: {error}"
+                )
+            else:
+                self.fail("expected SourcePinError to be raised")
+
     def test_rejects_duplicate_authority_key_in_raw_json(self):
         raw_json = json.dumps(valid_payload()).replace(
             '"repository": ',

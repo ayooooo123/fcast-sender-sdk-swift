@@ -1,4 +1,6 @@
 import argparse
+import ctypes
+import errno
 import os
 import secrets
 import stat
@@ -9,6 +11,12 @@ from pathlib import Path
 
 class OutputDirectoryError(ValueError):
     """Raised when a requested build output cannot be handled safely."""
+
+
+@dataclass(frozen=True)
+class PublicationResult:
+    committed: bool
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -252,47 +260,171 @@ def _validate_prepared(prepared):
         raise OutputDirectoryError("invalid prepared output final-inode token")
 
 
+def _rename_exclusive(source, destination, *, source_fd, destination_fd):
+    if sys.platform != "darwin":
+        raise OutputDirectoryError(
+            "exclusive rename support is unavailable on this platform"
+        )
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameatx_np = libc.renameatx_np
+    except (AttributeError, OSError) as error:
+        raise OutputDirectoryError(
+            "exclusive rename support is unavailable"
+        ) from error
+    renameatx_np.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameatx_np.restype = ctypes.c_int
+    result = renameatx_np(
+        source_fd,
+        os.fsencode(source),
+        destination_fd,
+        os.fsencode(destination),
+        0x00000004,
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        if error_number in (errno.EEXIST, errno.ENOTEMPTY):
+            raise FileExistsError(
+                error_number,
+                "exclusive rename destination already exists",
+                destination,
+            )
+        raise OSError(
+            error_number,
+            os.strerror(error_number),
+            f"{source} -> {destination}",
+        )
+
+
+def _restore_quarantine_or_fail(build_fd, prepared, quarantine_name, reason):
+    try:
+        _rename_exclusive(
+            quarantine_name,
+            prepared.final_name,
+            source_fd=build_fd,
+            destination_fd=build_fd,
+        )
+    except FileExistsError as error:
+        raise OutputDirectoryError(
+            f"{reason}; concurrent final .build/{prepared.final_name} and "
+            f"quarantine .build/{quarantine_name} were both preserved"
+        ) from error
+    except (OSError, OutputDirectoryError) as error:
+        raise OutputDirectoryError(
+            f"{reason}; quarantine .build/{quarantine_name} was preserved "
+            f"because restoration failed: {error}"
+        ) from error
+    raise OutputDirectoryError(
+        f"{reason}; quarantined entry was restored to "
+        f".build/{prepared.final_name}"
+    )
+
+
 def publish_output(root, prepared):
     _validate_prepared(prepared)
     build_fd = _open_build_root(root, create=False)
     quarantine_name = None
     try:
-        _require_same_directory(build_fd, prepared)
-        _require_staging(build_fd, prepared)
-        existing = _require_final_unchanged(build_fd, prepared)
-        if existing is not None:
-            quarantine_name = _unique_name(
-                build_fd,
-                f".{prepared.final_name}.quarantine-",
-                create=False,
-            )
-            os.rename(
-                prepared.final_name,
-                quarantine_name,
-                src_dir_fd=build_fd,
-                dst_dir_fd=build_fd,
-            )
         try:
-            os.rename(
-                prepared.staging_name,
-                prepared.final_name,
-                src_dir_fd=build_fd,
-                dst_dir_fd=build_fd,
-            )
-        except BaseException:
-            if quarantine_name is not None:
-                os.rename(
-                    quarantine_name,
-                    prepared.final_name,
-                    src_dir_fd=build_fd,
-                    dst_dir_fd=build_fd,
+            _require_same_directory(build_fd, prepared)
+            _require_staging(build_fd, prepared)
+            existing = _require_final_unchanged(build_fd, prepared)
+            if existing is not None:
+                quarantine_name = _unique_name(
+                    build_fd,
+                    f".{prepared.final_name}.quarantine-",
+                    create=False,
                 )
+                try:
+                    _rename_exclusive(
+                        prepared.final_name,
+                        quarantine_name,
+                        source_fd=build_fd,
+                        destination_fd=build_fd,
+                    )
+                except FileExistsError as error:
+                    raise OutputDirectoryError(
+                        "exclusive quarantine destination already exists; "
+                        "publication was not started"
+                    ) from error
+                quarantined = _lstat_at(build_fd, quarantine_name)
+                if (
+                    quarantined is None
+                    or stat.S_ISLNK(quarantined.st_mode)
+                    or not stat.S_ISDIR(quarantined.st_mode)
+                    or quarantined.st_dev != prepared.final_device
+                    or quarantined.st_ino != prepared.final_inode
+                ):
+                    _restore_quarantine_or_fail(
+                        build_fd,
+                        prepared,
+                        quarantine_name,
+                        "publication target changed after its initial check",
+                    )
+            try:
+                _rename_exclusive(
+                    prepared.staging_name,
+                    prepared.final_name,
+                    source_fd=build_fd,
+                    destination_fd=build_fd,
+                )
+            except FileExistsError as error:
+                if quarantine_name is not None:
+                    _restore_quarantine_or_fail(
+                        build_fd,
+                        prepared,
+                        quarantine_name,
+                        "concurrent final prevented exclusive stage publication",
+                    )
+                raise OutputDirectoryError(
+                    "concurrent final prevented exclusive stage publication; "
+                    "private staging was preserved"
+                ) from error
+        except OutputDirectoryError:
             raise
+        except OSError as error:
+            if quarantine_name is not None:
+                _restore_quarantine_or_fail(
+                    build_fd,
+                    prepared,
+                    quarantine_name,
+                    f"stage publication failed: {error}",
+                )
+            raise OutputDirectoryError(
+                f"unable to publish output safely: {error}"
+            ) from error
+
+        warnings = []
+        try:
+            os.fsync(build_fd)
+        except OSError as error:
+            warnings.append(
+                "publication committed but directory fsync failed: "
+                f"{error}"
+            )
         if quarantine_name is not None:
-            _remove_tree_at(build_fd, quarantine_name)
-        os.fsync(build_fd)
-    except OSError as error:
-        raise OutputDirectoryError(f"unable to publish output safely: {error}") from error
+            try:
+                _remove_tree_at(build_fd, quarantine_name)
+            except (OSError, OutputDirectoryError) as error:
+                warnings.append(
+                    "publication committed but old-output cleanup failed; "
+                    f"undeleted state may remain at .build/{quarantine_name}: "
+                    f"{error}"
+                )
+            try:
+                os.fsync(build_fd)
+            except OSError as error:
+                warnings.append(
+                    "publication committed but post-cleanup directory fsync "
+                    f"failed: {error}"
+                )
+        return PublicationResult(committed=True, warnings=tuple(warnings))
     finally:
         os.close(build_fd)
 
@@ -358,7 +490,16 @@ def main(argv=None):
             prepared = prepare_output(arguments.root, arguments.requested)
             print(prepared.as_tsv())
         elif arguments.command == "publish":
-            publish_output(arguments.root, _prepared_from_args(arguments))
+            result = publish_output(
+                arguments.root,
+                _prepared_from_args(arguments),
+            )
+            for warning in result.warnings:
+                print(
+                    "output directory warning: publication committed: "
+                    f"{warning}",
+                    file=sys.stderr,
+                )
         else:
             discard_output(arguments.root, _prepared_from_args(arguments))
     except OutputDirectoryError as error:

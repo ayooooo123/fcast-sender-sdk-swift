@@ -9,7 +9,13 @@ if [[ $# -ne 1 ]]; then
     exit 64
 fi
 
-python3 "$SCRIPT_DIR/build_boundary.py" check-environment
+if [[ "${MEDIASTORM_SANITIZED_BUILD:-}" != "1" ]]; then
+    python3 "$SCRIPT_DIR/build_boundary.py" check-environment
+    exec python3 "$SCRIPT_DIR/build_boundary.py" re-exec \
+        --script "$0" \
+        --argument "$1"
+fi
+python3 "$SCRIPT_DIR/build_boundary.py" check-sanitized-environment
 
 for tool in git rustup cargo xcodebuild lipo swift sw_vers python3 shasum; do
     if ! command -v "$tool" >/dev/null 2>&1; then
@@ -73,6 +79,15 @@ if [[ "$ZIP_OUTPUT" != *"This is Zip $EXPECTED_ZIP_VERSION "* ]]; then
 fi
 
 BUILD_TEMP="$(mktemp -d "${TMPDIR:-/tmp}/fcast-ios-distribution.XXXXXX")"
+OUTPUT_PREPARED=0
+cleanup() {
+    if [[ "$OUTPUT_PREPARED" == "1" ]]; then
+        output_helper discard || true
+    fi
+    rm -rf "$BUILD_TEMP"
+}
+trap cleanup EXIT
+
 BUILD_TEMP="$(cd "$BUILD_TEMP" && pwd -P)"
 CARGO_HOME="$BUILD_TEMP/cargo-home"
 CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=$BUILD_TEMP=/fcast-build"
@@ -106,11 +121,7 @@ output_helper() {
         --final-device "$OUTPUT_FINAL_DEVICE" \
         --final-inode "$OUTPUT_FINAL_INODE"
 }
-cleanup() {
-    output_helper discard || true
-    rm -rf "$BUILD_TEMP"
-}
-trap cleanup EXIT
+OUTPUT_PREPARED=1
 
 SOURCE_CHECKOUT="$BUILD_TEMP/source"
 GIT_TERMINAL_PROMPT=0 git clone --no-checkout "$SOURCE_REPOSITORY" "$SOURCE_CHECKOUT"

@@ -1,10 +1,21 @@
+import contextlib
+import io
+import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 class OutputDirectorySafetyTests(unittest.TestCase):
+    def load_module_object(self):
+        import scripts.output_directory as output_directory
+
+        return output_directory
+
     def load_module(self):
         from scripts.output_directory import (
             OutputDirectoryError,
@@ -165,6 +176,290 @@ class OutputDirectorySafetyTests(unittest.TestCase):
 
             self.assertEqual(marker.read_text(encoding="utf-8"), "preserve")
 
+    def test_existing_target_swap_after_check_is_restored_without_deleting_victim(self):
+        module = self.load_module_object()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / ".build" / "repro1"
+            target.mkdir(parents=True)
+            (target / "old").write_text("old", encoding="utf-8")
+            victim = root / ".build" / "victim"
+            victim.mkdir()
+            marker = victim / "marker"
+            marker.write_text("preserve", encoding="utf-8")
+            prepared = module.prepare_output(root, ".build/repro1")
+            staging = root / ".build" / prepared.staging_name
+            (staging / "new").write_text("new", encoding="utf-8")
+            original_unique_name = module._unique_name
+
+            def swap_after_check(build_fd, prefix, *, create):
+                if ".quarantine-" in prefix:
+                    target.rename(root / ".build" / "moved-old")
+                    victim.rename(target)
+                return original_unique_name(build_fd, prefix, create=create)
+
+            with mock.patch.object(
+                module,
+                "_unique_name",
+                side_effect=swap_after_check,
+            ):
+                with self.assertRaisesRegex(
+                    module.OutputDirectoryError,
+                    "changed.*quarantine|quarantine.*changed",
+                ):
+                    module.publish_output(root, prepared)
+
+            self.assertEqual(
+                (target / "marker").read_text(encoding="utf-8"),
+                "preserve",
+            )
+            self.assertTrue(staging.is_dir())
+
+    def test_absent_target_concurrently_created_after_check_is_not_replaced(self):
+        module = self.load_module_object()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prepared = module.prepare_output(root, ".build/repro2")
+            staging = root / ".build" / prepared.staging_name
+            (staging / "new").write_text("new", encoding="utf-8")
+            target = root / ".build" / "repro2"
+            original_check = module._require_final_unchanged
+            concurrent_inode = None
+
+            def create_after_check(build_fd, checked):
+                nonlocal concurrent_inode
+                result = original_check(build_fd, checked)
+                target.mkdir()
+                concurrent_inode = target.stat().st_ino
+                return result
+
+            with mock.patch.object(
+                module,
+                "_require_final_unchanged",
+                side_effect=create_after_check,
+            ):
+                with self.assertRaisesRegex(
+                    module.OutputDirectoryError,
+                    "concurrent|exclusive|already exists",
+                ):
+                    module.publish_output(root, prepared)
+
+            self.assertEqual(target.stat().st_ino, concurrent_inode)
+            self.assertTrue(staging.is_dir())
+
+    def test_concurrent_quarantine_destination_is_not_replaced(self):
+        module = self.load_module_object()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / ".build" / "repro1"
+            target.mkdir(parents=True)
+            (target / "old").write_text("old", encoding="utf-8")
+            prepared = module.prepare_output(root, ".build/repro1")
+            staging = root / ".build" / prepared.staging_name
+            (staging / "new").write_text("new", encoding="utf-8")
+            original_unique_name = module._unique_name
+            concurrent_name = None
+            concurrent_inode = None
+
+            def reserve_quarantine(build_fd, prefix, *, create):
+                nonlocal concurrent_name, concurrent_inode
+                name = original_unique_name(build_fd, prefix, create=create)
+                if ".quarantine-" in prefix:
+                    concurrent_name = name
+                    concurrent = root / ".build" / name
+                    concurrent.mkdir()
+                    concurrent_inode = concurrent.stat().st_ino
+                return name
+
+            with mock.patch.object(
+                module,
+                "_unique_name",
+                side_effect=reserve_quarantine,
+            ):
+                with self.assertRaisesRegex(
+                    module.OutputDirectoryError,
+                    "quarantine.*exists|exclusive",
+                ):
+                    module.publish_output(root, prepared)
+
+            self.assertEqual(
+                (root / ".build" / concurrent_name).stat().st_ino,
+                concurrent_inode,
+            )
+            self.assertEqual(
+                (target / "old").read_text(encoding="utf-8"),
+                "old",
+            )
+            self.assertTrue(staging.is_dir())
+
+    def test_failed_stage_publication_preserves_concurrent_final_and_old_quarantine(self):
+        module = self.load_module_object()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            build = root / ".build"
+            target = build / "repro1"
+            target.mkdir(parents=True)
+            (target / "old").write_text("old", encoding="utf-8")
+            prepared = module.prepare_output(root, ".build/repro1")
+            staging = build / prepared.staging_name
+            (staging / "new").write_text("new", encoding="utf-8")
+            original_rename = module._rename_exclusive
+            call_count = 0
+
+            def race_rename(
+                source,
+                destination,
+                *,
+                source_fd,
+                destination_fd,
+            ):
+                nonlocal call_count
+                call_count += 1
+                if call_count == 2:
+                    target.mkdir()
+                    (target / "concurrent").write_text(
+                        "preserve",
+                        encoding="utf-8",
+                    )
+                return original_rename(
+                    source,
+                    destination,
+                    source_fd=source_fd,
+                    destination_fd=destination_fd,
+                )
+
+            with mock.patch.object(
+                module,
+                "_rename_exclusive",
+                side_effect=race_rename,
+            ):
+                with self.assertRaisesRegex(
+                    module.OutputDirectoryError,
+                    "quarantine.*preserved|preserved.*quarantine",
+                ):
+                    module.publish_output(root, prepared)
+
+            self.assertEqual(
+                (target / "concurrent").read_text(encoding="utf-8"),
+                "preserve",
+            )
+            quarantines = list(build.glob(".repro1.quarantine-*"))
+            self.assertEqual(len(quarantines), 1)
+            self.assertEqual(
+                (quarantines[0] / "old").read_text(encoding="utf-8"),
+                "old",
+            )
+            self.assertTrue(staging.is_dir())
+
+    def test_exclusive_publication_fails_closed_when_platform_support_is_unavailable(self):
+        module = self.load_module_object()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prepared = module.prepare_output(root, ".build/repro2")
+            staging = root / ".build" / prepared.staging_name
+            (staging / "new").write_text("new", encoding="utf-8")
+
+            with mock.patch.object(module.sys, "platform", "linux"):
+                with self.assertRaisesRegex(
+                    module.OutputDirectoryError,
+                    "exclusive rename.*unavailable",
+                ):
+                    module.publish_output(root, prepared)
+
+            self.assertTrue(staging.is_dir())
+            self.assertFalse((root / ".build" / "repro2").exists())
+
+    def test_cleanup_failure_after_commit_returns_warning_and_keeps_new_final(self):
+        module = self.load_module_object()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            build = root / ".build"
+            target = build / "repro1"
+            target.mkdir(parents=True)
+            (target / "old").write_text("old", encoding="utf-8")
+            prepared = module.prepare_output(root, ".build/repro1")
+            staging = build / prepared.staging_name
+            (staging / "new").write_text("new", encoding="utf-8")
+
+            with mock.patch.object(
+                module,
+                "_remove_tree_at",
+                side_effect=module.OutputDirectoryError(
+                    "cleanup inspection denied"
+                ),
+            ):
+                result = module.publish_output(root, prepared)
+
+            self.assertTrue(result.committed)
+            self.assertRegex(
+                "\n".join(result.warnings),
+                "cleanup inspection denied",
+            )
+            self.assertEqual(
+                (target / "new").read_text(encoding="utf-8"),
+                "new",
+            )
+            quarantines = list(build.glob(".repro1.quarantine-*"))
+            self.assertEqual(len(quarantines), 1)
+            self.assertEqual(
+                (quarantines[0] / "old").read_text(encoding="utf-8"),
+                "old",
+            )
+
+    def test_post_commit_fsync_failure_returns_warning_and_cli_success(self):
+        module = self.load_module_object()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / ".build" / "repro2"
+            prepared = module.prepare_output(root, ".build/repro2")
+            staging = root / ".build" / prepared.staging_name
+            (staging / "new").write_text("new", encoding="utf-8")
+
+            with mock.patch.object(
+                module.os,
+                "fsync",
+                side_effect=OSError("post-commit fsync denied"),
+            ):
+                result = module.publish_output(root, prepared)
+
+            self.assertTrue(result.committed)
+            self.assertRegex(
+                "\n".join(result.warnings),
+                "committed.*fsync|fsync.*committed",
+            )
+            self.assertEqual(
+                (target / "new").read_text(encoding="utf-8"),
+                "new",
+            )
+            with mock.patch.object(module, "publish_output", return_value=result):
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    return_code = module.main(
+                        [
+                            "publish",
+                            "--root",
+                            str(root),
+                            "--final-name",
+                            prepared.final_name,
+                            "--staging-name",
+                            prepared.staging_name,
+                            "--build-device",
+                            str(prepared.build_device),
+                            "--build-inode",
+                            str(prepared.build_inode),
+                            "--staging-device",
+                            str(prepared.staging_device),
+                            "--staging-inode",
+                            str(prepared.staging_inode),
+                            "--final-device",
+                            str(prepared.final_device),
+                            "--final-inode",
+                            str(prepared.final_inode),
+                        ]
+                    )
+            self.assertEqual(return_code, 0)
+            self.assertRegex(stderr.getvalue(), "warning.*committed")
+
 
 class AmbientBuildEnvironmentTests(unittest.TestCase):
     def load_validator(self):
@@ -233,6 +528,189 @@ class AmbientBuildEnvironmentTests(unittest.TestCase):
             with self.subTest(name=name):
                 with self.assertRaisesRegex(Error, name):
                     validate({name: "attacker"})
+
+    def test_rejects_cc_rs_bindgen_libclang_and_pkg_config_variable_families(self):
+        Error, validate = self.load_validator()
+        poisoned_names = (
+            "CC_aarch64_apple_ios",
+            "CC_aarch64-apple-ios",
+            "CFLAGS_AARCH64_APPLE_IOS",
+            "AR_x86_64_apple_darwin",
+            "TARGET_CC",
+            "HOST_CC",
+            "TARGET_CXXFLAGS",
+            "HOST_CPPFLAGS",
+            "TARGET_LD",
+            "HOST_LDFLAGS",
+            "CRATE_CC_NO_DEFAULTS",
+            "BINDGEN_EXTRA_CLANG_ARGS",
+            "BINDGEN_EXTRA_CLANG_ARGS_aarch64_apple_ios",
+            "LIBCLANG_PATH",
+            "CLANG_PATH",
+            "PKG_CONFIG",
+            "PKG_CONFIG_PATH",
+            "PKG_CONFIG_SYSROOT_DIR_aarch64_apple_ios",
+            "AARCH64_APPLE_IOS_PKG_CONFIG_PATH",
+        )
+        for name in poisoned_names:
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(Error, name):
+                    validate({name: "attacker"})
+
+    def test_sanitized_child_environment_is_an_explicit_allowlist(self):
+        root = Path(__file__).resolve().parents[1]
+        command = [
+            sys.executable,
+            str(root / "scripts" / "build_boundary.py"),
+            "sanitized-environment",
+        ]
+        ambient = {
+            "PATH": "/safe/bin",
+            "HOME": "/safe/home",
+            "TMPDIR": "/safe/tmp",
+            "LANG": "en_US.UTF-8",
+            "LC_ALL": "C",
+            "HTTPS_PROXY": "http://127.0.0.1:8080",
+            "NO_PROXY": "localhost",
+            "CARGO_HTTP_TIMEOUT": "600",
+            "CARGO_NET_GIT_FETCH_WITH_CLI": "true",
+            "RUST_LOG": "secret",
+            "SSH_AUTH_SOCK": "/secret/agent",
+            "UNRELATED_SECRET": "do-not-leak",
+        }
+        result = subprocess.run(
+            command,
+            env=ambient,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        sanitized = json.loads(result.stdout)
+        self.assertEqual(
+            sanitized,
+            {
+                "CARGO_HTTP_TIMEOUT": "600",
+                "CARGO_NET_GIT_FETCH_WITH_CLI": "true",
+                "GIT_CONFIG_GLOBAL": "/dev/null",
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_TERMINAL_PROMPT": "0",
+                "HOME": "/safe/home",
+                "HTTPS_PROXY": "http://127.0.0.1:8080",
+                "LANG": "en_US.UTF-8",
+                "LC_ALL": "C",
+                "MEDIASTORM_SANITIZED_BUILD": "1",
+                "NO_PROXY": "localhost",
+                "PATH": "/safe/bin",
+                "TMPDIR": "/safe/tmp",
+            },
+        )
+
+    def test_sanitized_environment_check_rejects_spoofed_sentinel_with_extra_state(self):
+        root = Path(__file__).resolve().parents[1]
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(root / "scripts" / "build_boundary.py"),
+                "check-sanitized-environment",
+            ],
+            env={
+                "PATH": "/safe/bin",
+                "HOME": "/safe/home",
+                "MEDIASTORM_SANITIZED_BUILD": "1",
+                "GIT_CONFIG_GLOBAL": "/dev/null",
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_TERMINAL_PROMPT": "0",
+                "UNRELATED_SECRET": "must-not-reach-build",
+            },
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertRegex(result.stderr, "UNRELATED_SECRET")
+
+    def test_sanitized_environment_check_allows_macos_encoding_runtime_state(self):
+        root = Path(__file__).resolve().parents[1]
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(root / "scripts" / "build_boundary.py"),
+                "check-sanitized-environment",
+            ],
+            env={
+                "PATH": "/safe/bin",
+                "HOME": "/safe/home",
+                "MEDIASTORM_SANITIZED_BUILD": "1",
+                "GIT_CONFIG_GLOBAL": "/dev/null",
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_TERMINAL_PROMPT": "0",
+                "__CF_USER_TEXT_ENCODING": "0x1F5:0x0:0x0",
+            },
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_output_preparation_failure_removes_private_build_temp(self):
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            temporary_root = fixture / "tmp"
+            temporary_root.mkdir()
+            fake_bin = fixture / "bin"
+            fake_bin.mkdir()
+            (fake_bin / "python3").symlink_to(sys.executable)
+            command_outputs = {
+                "sw_vers": "26.0\n",
+                "xcodebuild": "Xcode 26.6\nBuild version 17F113\n",
+                "swift": (
+                    "Apple Swift version 6.3.3 "
+                    "(swiftlang-6.3.3.1.3 clang-1700.0.0.0)\n"
+                ),
+                "rustup": "rustc 1.96.1 (31fca3adb 2026-06-26)\n",
+            }
+            for name in (
+                "git",
+                "rustup",
+                "cargo",
+                "xcodebuild",
+                "lipo",
+                "swift",
+                "sw_vers",
+                "shasum",
+            ):
+                executable = fake_bin / name
+                executable.write_text(
+                    "#!/bin/sh\n"
+                    f"printf '%b' {command_outputs.get(name, '')!r}\n",
+                    encoding="utf-8",
+                )
+                executable.chmod(0o755)
+            environment = {
+                "PATH": f"{fake_bin}:/usr/bin:/bin",
+                "HOME": str(fixture / "home"),
+                "TMPDIR": f"{temporary_root}/",
+                "LANG": "C",
+            }
+            result = subprocess.run(
+                [str(root / "scripts" / "build-ios.sh"), ".build/a/b"],
+                cwd=root,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(
+                list(temporary_root.glob("fcast-ios-distribution.*")),
+                [],
+                result.stderr,
+            )
 
     def test_build_script_checks_poisoning_and_uses_private_cargo_home(self):
         root = Path(__file__).resolve().parents[1]

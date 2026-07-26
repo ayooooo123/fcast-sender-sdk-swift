@@ -342,6 +342,22 @@ class ReleaseMetadataTests(unittest.TestCase):
             ):
                 BuildEnvironment.load(path)
 
+    def test_build_environment_rejects_invalid_utf8_with_domain_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "build-environment.lock.json"
+            path.write_bytes(b"\xff")
+            try:
+                BuildEnvironment.load(path)
+            except ReleaseMetadataError as error:
+                self.assertRegex(str(error), "UTF-8|build environment")
+            except Exception as error:
+                self.fail(
+                    "expected ReleaseMetadataError, "
+                    f"got {type(error).__name__}: {error}"
+                )
+            else:
+                self.fail("expected ReleaseMetadataError to be raised")
+
     def test_serialize_json_is_canonical_utf8_text(self):
         payload = {"z": "café", "a": {"second": 2, "first": 1}}
         rendered = serialize_json(payload)
