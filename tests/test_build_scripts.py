@@ -11,6 +11,100 @@ VERIFY_SCRIPT = REPOSITORY_ROOT / "scripts" / "verify-artifact.sh"
 
 
 class BuildScriptTests(unittest.TestCase):
+    def run_build_with_side_effect_sentinels(self, arguments):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            fake_bin = fixture / "bin"
+            fake_bin.mkdir()
+            side_effect_log = fixture / "side-effects"
+            for name in ("python3", "mktemp", "git"):
+                executable = fake_bin / name
+                executable.write_text(
+                    "#!/bin/sh\n"
+                    f"printf '%s\\n' {name!r} "
+                    '>> "$MEDIASTORM_TEST_SIDE_EFFECT_LOG"\n'
+                    "exit 97\n",
+                    encoding="utf-8",
+                )
+                executable.chmod(0o755)
+            result = subprocess.run(
+                [str(BUILD_SCRIPT), *arguments],
+                cwd=REPOSITORY_ROOT,
+                env={
+                    "PATH": f"{fake_bin}:/usr/bin:/bin",
+                    "HOME": str(fixture / "home"),
+                    "TMPDIR": f"{fixture}/",
+                    "MEDIASTORM_TEST_SIDE_EFFECT_LOG": str(side_effect_log),
+                },
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            observed = (
+                side_effect_log.read_text(encoding="utf-8").splitlines()
+                if side_effect_log.exists()
+                else []
+            )
+            return result, observed
+
+    def assert_build_cli_rejected_before_side_effects(self, arguments):
+        result, observed = self.run_build_with_side_effect_sentinels(arguments)
+        self.assertEqual(result.returncode, 64, result.stderr)
+        self.assertEqual(
+            result.stderr,
+            f"usage: {BUILD_SCRIPT} --output "
+            "<repo-.build-distribution-output>\n",
+        )
+        self.assertEqual(observed, [])
+
+    def test_build_accepts_literal_output_option_followed_by_nonempty_value(self):
+        result, observed = self.run_build_with_side_effect_sentinels(
+            ["--output", ".build/repro1"]
+        )
+
+        self.assertEqual(result.returncode, 97, result.stderr)
+        self.assertEqual(observed, ["python3"])
+        self.assertNotIn("usage:", result.stderr)
+
+    def test_build_rejects_no_arguments_before_side_effects(self):
+        self.assert_build_cli_rejected_before_side_effects([])
+
+    def test_build_rejects_bare_positional_path_before_side_effects(self):
+        self.assert_build_cli_rejected_before_side_effects([".build/repro1"])
+
+    def test_build_rejects_output_option_without_value_before_side_effects(self):
+        self.assert_build_cli_rejected_before_side_effects(["--output"])
+
+    def test_build_rejects_empty_output_value_before_side_effects(self):
+        self.assert_build_cli_rejected_before_side_effects(["--output", ""])
+
+    def test_build_rejects_wrong_option_before_side_effects(self):
+        self.assert_build_cli_rejected_before_side_effects(
+            ["--destination", ".build/repro1"]
+        )
+
+    def test_build_rejects_extra_argument_before_side_effects(self):
+        self.assert_build_cli_rejected_before_side_effects(
+            ["--output", ".build/repro1", "extra"]
+        )
+
+    def test_build_rejects_duplicate_output_option_before_side_effects(self):
+        self.assert_build_cli_rejected_before_side_effects(
+            [
+                "--output",
+                ".build/repro1",
+                "--output",
+                ".build/repro2",
+            ]
+        )
+
+    def test_build_passes_parsed_output_variable_to_preparation(self):
+        text = BUILD_SCRIPT.read_text(encoding="utf-8")
+        preparation = text[text.index("OUTPUT_PREPARATION=") :]
+
+        self.assertIn('--requested "$REQUESTED_OUTPUT"', preparation)
+        self.assertNotIn('--requested "$1"', preparation)
+
     def test_build_preflights_lipo_before_starting_the_expensive_build(self):
         text = BUILD_SCRIPT.read_text(encoding="utf-8")
         self.assertRegex(

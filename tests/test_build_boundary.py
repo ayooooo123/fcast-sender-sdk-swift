@@ -973,6 +973,39 @@ class AmbientBuildEnvironmentTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_reexec_preserves_the_build_output_option_and_value(self):
+        import scripts.build_boundary as build_boundary
+
+        child_environment = {"PATH": "/safe/bin"}
+        with (
+            mock.patch.object(
+                build_boundary,
+                "sanitized_environment",
+                return_value=child_environment,
+            ),
+            mock.patch.object(build_boundary.os, "execve") as execve,
+        ):
+            result = build_boundary.main(
+                [
+                    "re-exec",
+                    "--script",
+                    "/repo/scripts/build-ios.sh",
+                    "--argument",
+                    ".build/repro1",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        execve.assert_called_once_with(
+            "/repo/scripts/build-ios.sh",
+            [
+                "/repo/scripts/build-ios.sh",
+                "--output",
+                ".build/repro1",
+            ],
+            child_environment,
+        )
+
     def test_output_preparation_failure_removes_private_build_temp(self):
         root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as directory:
@@ -1015,7 +1048,11 @@ class AmbientBuildEnvironmentTests(unittest.TestCase):
                 "LANG": "C",
             }
             result = subprocess.run(
-                [str(root / "scripts" / "build-ios.sh"), ".build/a/b"],
+                [
+                    str(root / "scripts" / "build-ios.sh"),
+                    "--output",
+                    ".build/a/b",
+                ],
                 cwd=root,
                 env=environment,
                 text=True,

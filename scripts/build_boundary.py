@@ -189,7 +189,11 @@ def main(argv=None):
             child_environment = sanitized_environment(os.environ)
             os.execve(
                 arguments.script,
-                [arguments.script, arguments.argument],
+                [
+                    arguments.script,
+                    "--output",
+                    arguments.argument,
+                ],
                 child_environment,
             )
     except BuildBoundaryError as error:

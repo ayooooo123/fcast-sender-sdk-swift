@@ -4,16 +4,22 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPOSITORY_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 
-if [[ $# -ne 1 ]]; then
-    echo "usage: $0 <repo-.build-distribution-output>" >&2
+if [[ $# -ne 2 ]]; then
+    echo "usage: $0 --output <repo-.build-distribution-output>" >&2
     exit 64
 fi
+if [[ "$1" != "--output" || -z "$2" ]]; then
+    echo "usage: $0 --output <repo-.build-distribution-output>" >&2
+    exit 64
+fi
+REQUESTED_OUTPUT="$2"
+shift 2
 
 if [[ "${MEDIASTORM_SANITIZED_BUILD:-}" != "1" ]]; then
     python3 "$SCRIPT_DIR/build_boundary.py" check-environment
     exec python3 "$SCRIPT_DIR/build_boundary.py" re-exec \
         --script "$0" \
-        --argument "$1"
+        --argument "$REQUESTED_OUTPUT"
 fi
 python3 "$SCRIPT_DIR/build_boundary.py" check-sanitized-environment
 
@@ -100,7 +106,7 @@ mkdir -p "$CARGO_HOME"
 OUTPUT_PREPARATION="$(
     python3 "$SCRIPT_DIR/output_directory.py" prepare \
         --root "$REPOSITORY_ROOT" \
-        --requested "$1"
+        --requested "$REQUESTED_OUTPUT"
 )"
 IFS=$'\t' read -r \
     OUTPUT_FINAL_NAME OUTPUT_STAGING_NAME OUTPUT_BUILD_DEVICE \
