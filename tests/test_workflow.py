@@ -69,6 +69,23 @@ def run_manifest_validator(text, manifest):
         )
 
 
+def yaml_structural_lines(text):
+    structural = []
+    scalar_indent = None
+    block_scalar = re.compile(r":\s*[>|][+-]?\s*(?:#.*)?$")
+    for line in text.splitlines():
+        stripped = line.lstrip(" ")
+        indent = len(line) - len(stripped)
+        if scalar_indent is not None:
+            if not stripped or indent > scalar_indent:
+                continue
+            scalar_indent = None
+        structural.append(line)
+        if block_scalar.search(line):
+            scalar_indent = indent
+    return structural
+
+
 def action_declarations(text):
     action_key = re.compile(
         r"""(?x)(?:"uses"|'uses'|(?<![0-9A-Za-z_-])uses)\s*:"""
@@ -76,10 +93,18 @@ def action_declarations(text):
     explicit_action_key = re.compile(
         r"""(?x)^\s*(?:-\s*)?\?\s*(?:"uses"|'uses'|uses)\s*$"""
     )
+    alternate_yaml_mechanism = re.compile(
+        r"""(?x)(?:\\|^\s*(?:-\s*)?\?|"""
+        r"""(?:^|[\s{,])[&*][A-Za-z_]|<<:|!!|^\s*%)"""
+    )
     return [
         line.strip()
-        for line in text.splitlines()
-        if action_key.search(line) or explicit_action_key.search(line)
+        for line in yaml_structural_lines(text)
+        if (
+            action_key.search(line)
+            or explicit_action_key.search(line)
+            or alternate_yaml_mechanism.search(line)
+        )
     ]
 
 
@@ -168,8 +193,8 @@ def assert_mutable_manifest_scan(test, text):
         "branch[[:space:]]*:",
         "\\.package\\([^)]*from[[:space:]]*:",
         "python3 - <<'PY'",
-        "url_token.findall(manifest)",
-        "allowed_url.fullmatch(urls[0])",
+        "url_token.findall(code)",
+        "allowed_url.fullmatch(declarations[0])",
         "releases/download/",
         "fcast_sender_sdk\\.xcframework\\.zip",
         "exactly one immutable versioned",
@@ -336,6 +361,34 @@ class WorkflowPolicyTests(unittest.TestCase):
                 "        : owner/dangerous-action@v1",
                 1,
             ),
+            text.replace(
+                f"uses: actions/checkout@{CHECKOUT_SHA}",
+                f"uses: actions/checkout@{CHECKOUT_SHA}\n"
+                '      - "u\\u0073es": owner/dangerous-action@v1',
+                1,
+            ),
+            text.replace(
+                f"uses: actions/checkout@{CHECKOUT_SHA}",
+                "x-action-key: &action-key uses\n"
+                f"        uses: actions/checkout@{CHECKOUT_SHA}\n"
+                "      - *action-key: owner/dangerous-action@v1",
+                1,
+            ),
+            text.replace(
+                f"uses: actions/checkout@{CHECKOUT_SHA}",
+                f"uses: actions/checkout@{CHECKOUT_SHA}\n"
+                '      - "u\\\n'
+                '          ses": owner/dangerous-action@v1',
+                1,
+            ),
+            text.replace(
+                f"uses: actions/checkout@{CHECKOUT_SHA}",
+                f"uses: actions/checkout@{CHECKOUT_SHA}\n"
+                "      - ? |-\n"
+                "          uses\n"
+                "        : owner/dangerous-action@v1",
+                1,
+            ),
         )
         for mutation in mutations:
             with self.subTest(mutation=mutation[:120]):
@@ -387,7 +440,7 @@ class WorkflowPolicyTests(unittest.TestCase):
     def test_manifest_scan_rejects_all_mutable_reference_classes(self):
         assert_mutable_manifest_scan(self, workflow_text())
 
-    def test_manifest_validator_accepts_only_the_exact_url_token(self):
+    def test_manifest_validator_accepts_the_canonical_bound_url(self):
         text = workflow_text()
         manifest = (REPOSITORY_ROOT / "Package.swift").read_text(encoding="utf-8")
         result = run_manifest_validator(text, manifest)
@@ -411,6 +464,60 @@ class WorkflowPolicyTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("immutable versioned release asset URL", result.stderr)
 
+    def test_manifest_validator_rejects_unbound_composed_and_alternate_urls(self):
+        text = workflow_text()
+        manifest = (REPOSITORY_ROOT / "Package.swift").read_text(encoding="utf-8")
+        url = re.search(r'https://[^"]+', manifest).group(0)
+        bypasses = (
+            manifest.replace(
+                f'let url = "{url}"',
+                f'let allowed = "{url}"\n'
+                'let url = "ht" + "tps://evil.example/latest.zip"',
+                1,
+            ),
+            manifest.replace(
+                f'let url = "{url}"',
+                f'let allowed = "{url}"\n'
+                'let evil = "ht" + "tps://evil.example/latest.zip"\n'
+                "let url = evil",
+                1,
+            ),
+            manifest.replace("url: url,", "url: evil,", 1),
+            manifest.replace(
+                ".binaryTarget(name: \"fcast_sender_sdkFFI\", "
+                "url: url, checksum: checksum)",
+                ".binaryTarget(name: \"fcast_sender_sdkFFI\", "
+                "path: \"Artifacts/fcast_sender_sdk.xcframework\")",
+                1,
+            ),
+        )
+        for bypass in bypasses:
+            with self.subTest(bypass=bypass):
+                result = run_manifest_validator(text, bypass)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("canonical binaryTarget URL binding", result.stderr)
+
+    def test_manifest_validator_rejects_shadowed_or_redefined_url_binding(self):
+        text = workflow_text()
+        manifest = (REPOSITORY_ROOT / "Package.swift").read_text(encoding="utf-8")
+        bypasses = (
+            manifest.replace(
+                "let checksum =",
+                'let shadow = url\nlet checksum =',
+                1,
+            ),
+            manifest.replace(
+                "let checksum =",
+                'let url = "https://evil.example/latest.zip"\nlet checksum =',
+                1,
+            ),
+        )
+        for bypass in bypasses:
+            with self.subTest(bypass=bypass):
+                result = run_manifest_validator(text, bypass)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("canonical binaryTarget URL binding", result.stderr)
+
     def test_manifest_scan_policy_mutations_are_rejected(self):
         text = workflow_text()
         for fragment in (
@@ -421,8 +528,8 @@ class WorkflowPolicyTests(unittest.TestCase):
             "branch[[:space:]]*:",
             "\\.package\\([^)]*from[[:space:]]*:",
             "python3 - <<'PY'",
-            "url_token.findall(manifest)",
-            "allowed_url.fullmatch(urls[0])",
+            "url_token.findall(code)",
+            "allowed_url.fullmatch(declarations[0])",
             "releases/download/",
             "fcast_sender_sdk\\.xcframework\\.zip",
         ):

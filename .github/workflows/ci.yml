@@ -91,7 +91,62 @@ jobs:
           import sys
           from pathlib import Path
 
+          def strip_comments(source):
+              output = []
+              index = 0
+              state = "code"
+              block_depth = 0
+              while index < len(source):
+                  pair = source[index:index + 2]
+                  character = source[index]
+                  if state == "code":
+                      if pair == "//":
+                          output.extend((" ", " "))
+                          index += 2
+                          state = "line-comment"
+                      elif pair == "/*":
+                          output.extend((" ", " "))
+                          index += 2
+                          state = "block-comment"
+                          block_depth = 1
+                      else:
+                          output.append(character)
+                          index += 1
+                          if character == '"':
+                              state = "string"
+                  elif state == "string":
+                      output.append(character)
+                      index += 1
+                      if character == "\\" and index < len(source):
+                          output.append(source[index])
+                          index += 1
+                      elif character == '"':
+                          state = "code"
+                  elif state == "line-comment":
+                      output.append("\n" if character == "\n" else " ")
+                      index += 1
+                      if character == "\n":
+                          state = "code"
+                  else:
+                      if pair == "/*":
+                          output.extend((" ", " "))
+                          index += 2
+                          block_depth += 1
+                      elif pair == "*/":
+                          output.extend((" ", " "))
+                          index += 2
+                          block_depth -= 1
+                          if block_depth == 0:
+                              state = "code"
+                      else:
+                          output.append("\n" if character == "\n" else " ")
+                          index += 1
+              if state in ("string", "block-comment"):
+                  raise SystemExit("Package.swift contains an unterminated token")
+              return "".join(output)
+
           manifest = Path("Package.swift").read_text(encoding="utf-8")
+          code = strip_comments(manifest)
           url_token = re.compile(r"""https?://[^\s"'<>]+""")
           allowed_url = re.compile(
               r"https://github\.com/ayooooo123/fcast-sender-sdk-swift/"
@@ -100,11 +155,35 @@ jobs:
               r"(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?/"
               r"fcast_sender_sdk\.xcframework\.zip"
           )
-          urls = url_token.findall(manifest)
-          if len(urls) != 1 or allowed_url.fullmatch(urls[0]) is None:
+          declaration = re.compile(
+              r'(?m)^[ \t]*let[ \t]+url[ \t]*=[ \t]*'
+              r'"([^"\\\r\n]+)"[ \t]*$'
+          )
+          binary_binding = re.compile(
+              r'(?m)^[ \t]*\.binaryTarget\([ \t]*'
+              r'name:[ \t]*"fcast_sender_sdkFFI",[ \t]*'
+              r'url:[ \t]*url,[ \t]*'
+              r'checksum:[ \t]*checksum[ \t]*\),[ \t]*$'
+          )
+
+          declarations = declaration.findall(code)
+          binary_calls = re.findall(r"\.binaryTarget[ \t]*\(", code)
+          binary_bindings = binary_binding.findall(code)
+          url_identifiers = re.findall(r"\burl\b", code)
+          urls = url_token.findall(code)
+          binding_is_canonical = (
+              len(declarations) == 1
+              and len(binary_calls) == 1
+              and len(binary_bindings) == 1
+              and len(url_identifiers) == 3
+              and len(urls) == 1
+              and urls[0] == declarations[0]
+              and allowed_url.fullmatch(declarations[0]) is not None
+          )
+          if not binding_is_canonical:
               print(
-                  "Package.swift must contain exactly one immutable versioned "
-                  "release asset URL",
+                  "Package.swift violates the canonical binaryTarget URL "
+                  "binding to exactly one immutable versioned release asset URL",
                   file=sys.stderr,
               )
               raise SystemExit(1)
