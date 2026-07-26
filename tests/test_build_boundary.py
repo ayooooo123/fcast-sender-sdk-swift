@@ -86,8 +86,10 @@ class OutputDirectorySafetyTests(unittest.TestCase):
             )
             (staging / "new").write_text("new", encoding="utf-8")
 
-            publish(root, prepared)
+            result = publish(root, prepared)
 
+            self.assertTrue(result.committed)
+            self.assertEqual(result.warnings, ())
             self.assertFalse((target / "old").exists())
             self.assertEqual(
                 (target / "new").read_text(encoding="utf-8"),
@@ -246,6 +248,322 @@ class OutputDirectorySafetyTests(unittest.TestCase):
 
             self.assertEqual(target.stat().st_ino, concurrent_inode)
             self.assertTrue(staging.is_dir())
+
+    def test_symlink_swapped_for_checked_staging_is_recovered_and_old_target_restored(
+        self,
+    ):
+        module = self.load_module_object()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            build = root / ".build"
+            target = build / "repro1"
+            target.mkdir(parents=True)
+            (target / "old").write_text("old", encoding="utf-8")
+            victim = build / "symlink-target"
+            victim.mkdir()
+            (victim / "unexpected").write_text("preserve", encoding="utf-8")
+            prepared = module.prepare_output(root, ".build/repro1")
+            staging = build / prepared.staging_name
+            (staging / "verified").write_text("verified", encoding="utf-8")
+            moved_verified = build / "verified-staging-moved"
+            original_require_staging = module._require_staging
+
+            def swap_after_staging_check(build_fd, checked):
+                result = original_require_staging(build_fd, checked)
+                staging.rename(moved_verified)
+                staging.symlink_to(victim, target_is_directory=True)
+                return result
+
+            with mock.patch.object(
+                module,
+                "_require_staging",
+                side_effect=swap_after_staging_check,
+            ):
+                with self.assertRaisesRegex(
+                    module.OutputDirectoryError,
+                    "staging identity.*recovery.*restored",
+                ):
+                    module.publish_output(root, prepared)
+
+            self.assertFalse(target.is_symlink())
+            self.assertEqual(
+                (target / "old").read_text(encoding="utf-8"),
+                "old",
+            )
+            self.assertEqual(
+                (moved_verified / "verified").read_text(encoding="utf-8"),
+                "verified",
+            )
+            recoveries = list(build.glob(".repro1.recovery-*"))
+            self.assertEqual(len(recoveries), 1)
+            self.assertTrue(recoveries[0].is_symlink())
+            self.assertEqual(
+                (recoveries[0].resolve() / "unexpected").read_text(
+                    encoding="utf-8"
+                ),
+                "preserve",
+            )
+            self.assertEqual(list(build.glob(".repro1.quarantine-*")), [])
+
+    def test_unverified_directory_swapped_for_checked_staging_is_recovered(
+        self,
+    ):
+        module = self.load_module_object()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            build = root / ".build"
+            target = build / "repro1"
+            target.mkdir(parents=True)
+            (target / "old").write_text("old", encoding="utf-8")
+            prepared = module.prepare_output(root, ".build/repro1")
+            staging = build / prepared.staging_name
+            (staging / "verified").write_text("verified", encoding="utf-8")
+            moved_verified = build / "verified-staging-moved"
+            unexpected_inode = None
+            original_require_staging = module._require_staging
+
+            def swap_after_staging_check(build_fd, checked):
+                nonlocal unexpected_inode
+                result = original_require_staging(build_fd, checked)
+                staging.rename(moved_verified)
+                staging.mkdir()
+                (staging / "unexpected").write_text(
+                    "preserve",
+                    encoding="utf-8",
+                )
+                unexpected_inode = staging.stat().st_ino
+                return result
+
+            with mock.patch.object(
+                module,
+                "_require_staging",
+                side_effect=swap_after_staging_check,
+            ):
+                with self.assertRaisesRegex(
+                    module.OutputDirectoryError,
+                    "staging identity.*recovery.*restored",
+                ):
+                    module.publish_output(root, prepared)
+
+            self.assertEqual(
+                (target / "old").read_text(encoding="utf-8"),
+                "old",
+            )
+            self.assertEqual(
+                (moved_verified / "verified").read_text(encoding="utf-8"),
+                "verified",
+            )
+            recoveries = list(build.glob(".repro1.recovery-*"))
+            self.assertEqual(len(recoveries), 1)
+            self.assertEqual(recoveries[0].stat().st_ino, unexpected_inode)
+            self.assertEqual(
+                (recoveries[0] / "unexpected").read_text(encoding="utf-8"),
+                "preserve",
+            )
+            self.assertEqual(list(build.glob(".repro1.quarantine-*")), [])
+
+    def test_unverified_directory_swapped_for_checked_staging_at_absent_target_is_recovered(
+        self,
+    ):
+        module = self.load_module_object()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            build = root / ".build"
+            prepared = module.prepare_output(root, ".build/repro2")
+            staging = build / prepared.staging_name
+            (staging / "verified").write_text("verified", encoding="utf-8")
+            moved_verified = build / "verified-staging-moved"
+            original_require_staging = module._require_staging
+
+            def swap_after_staging_check(build_fd, checked):
+                result = original_require_staging(build_fd, checked)
+                staging.rename(moved_verified)
+                staging.mkdir()
+                (staging / "unexpected").write_text(
+                    "preserve",
+                    encoding="utf-8",
+                )
+                return result
+
+            with mock.patch.object(
+                module,
+                "_require_staging",
+                side_effect=swap_after_staging_check,
+            ):
+                with self.assertRaisesRegex(
+                    module.OutputDirectoryError,
+                    "staging identity.*recovery.*final.*absent",
+                ):
+                    module.publish_output(root, prepared)
+
+            self.assertFalse((build / "repro2").exists())
+            self.assertEqual(
+                (moved_verified / "verified").read_text(encoding="utf-8"),
+                "verified",
+            )
+            recoveries = list(build.glob(".repro2.recovery-*"))
+            self.assertEqual(len(recoveries), 1)
+            self.assertEqual(
+                (recoveries[0] / "unexpected").read_text(encoding="utf-8"),
+                "preserve",
+            )
+
+    def test_blocked_staging_recovery_preserves_unexpected_final_and_old_quarantine(
+        self,
+    ):
+        module = self.load_module_object()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            build = root / ".build"
+            target = build / "repro1"
+            target.mkdir(parents=True)
+            (target / "old").write_text("old", encoding="utf-8")
+            prepared = module.prepare_output(root, ".build/repro1")
+            staging = build / prepared.staging_name
+            (staging / "verified").write_text("verified", encoding="utf-8")
+            moved_verified = build / "verified-staging-moved"
+            original_require_staging = module._require_staging
+            original_unique_name = module._unique_name
+            recovery_name = None
+
+            def swap_after_staging_check(build_fd, checked):
+                result = original_require_staging(build_fd, checked)
+                staging.rename(moved_verified)
+                staging.mkdir()
+                (staging / "unexpected").write_text(
+                    "preserve",
+                    encoding="utf-8",
+                )
+                return result
+
+            def block_recovery_name(build_fd, prefix, *, create):
+                nonlocal recovery_name
+                name = original_unique_name(build_fd, prefix, create=create)
+                if ".recovery-" in prefix:
+                    recovery_name = name
+                    (build / name).mkdir()
+                return name
+
+            with (
+                mock.patch.object(
+                    module,
+                    "_require_staging",
+                    side_effect=swap_after_staging_check,
+                ),
+                mock.patch.object(
+                    module,
+                    "_unique_name",
+                    side_effect=block_recovery_name,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    module.OutputDirectoryError,
+                    "staging identity.*unexpected final.*quarantine.*preserved",
+                ):
+                    module.publish_output(root, prepared)
+
+            self.assertEqual(
+                (target / "unexpected").read_text(encoding="utf-8"),
+                "preserve",
+            )
+            quarantines = list(build.glob(".repro1.quarantine-*"))
+            self.assertEqual(len(quarantines), 1)
+            self.assertEqual(
+                (quarantines[0] / "old").read_text(encoding="utf-8"),
+                "old",
+            )
+            self.assertTrue((build / recovery_name).is_dir())
+            self.assertEqual(
+                (moved_verified / "verified").read_text(encoding="utf-8"),
+                "verified",
+            )
+
+    def test_blocked_old_target_restore_preserves_every_publication_entry(self):
+        module = self.load_module_object()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            build = root / ".build"
+            target = build / "repro1"
+            target.mkdir(parents=True)
+            (target / "old").write_text("old", encoding="utf-8")
+            prepared = module.prepare_output(root, ".build/repro1")
+            staging = build / prepared.staging_name
+            (staging / "verified").write_text("verified", encoding="utf-8")
+            moved_verified = build / "verified-staging-moved"
+            original_require_staging = module._require_staging
+            original_rename = module._rename_exclusive
+            rename_count = 0
+
+            def swap_after_staging_check(build_fd, checked):
+                result = original_require_staging(build_fd, checked)
+                staging.rename(moved_verified)
+                staging.mkdir()
+                (staging / "unexpected").write_text(
+                    "preserve",
+                    encoding="utf-8",
+                )
+                return result
+
+            def block_restore(
+                source,
+                destination,
+                *,
+                source_fd,
+                destination_fd,
+            ):
+                nonlocal rename_count
+                rename_count += 1
+                if rename_count == 4:
+                    target.mkdir()
+                    (target / "concurrent").write_text(
+                        "preserve",
+                        encoding="utf-8",
+                    )
+                return original_rename(
+                    source,
+                    destination,
+                    source_fd=source_fd,
+                    destination_fd=destination_fd,
+                )
+
+            with (
+                mock.patch.object(
+                    module,
+                    "_require_staging",
+                    side_effect=swap_after_staging_check,
+                ),
+                mock.patch.object(
+                    module,
+                    "_rename_exclusive",
+                    side_effect=block_restore,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    module.OutputDirectoryError,
+                    "staging identity.*recovery.*quarantine.*preserved",
+                ):
+                    module.publish_output(root, prepared)
+
+            self.assertEqual(
+                (target / "concurrent").read_text(encoding="utf-8"),
+                "preserve",
+            )
+            recoveries = list(build.glob(".repro1.recovery-*"))
+            self.assertEqual(len(recoveries), 1)
+            self.assertEqual(
+                (recoveries[0] / "unexpected").read_text(encoding="utf-8"),
+                "preserve",
+            )
+            quarantines = list(build.glob(".repro1.quarantine-*"))
+            self.assertEqual(len(quarantines), 1)
+            self.assertEqual(
+                (quarantines[0] / "old").read_text(encoding="utf-8"),
+                "old",
+            )
+            self.assertEqual(
+                (moved_verified / "verified").read_text(encoding="utf-8"),
+                "verified",
+            )
 
     def test_concurrent_quarantine_destination_is_not_replaced(self):
         module = self.load_module_object()

@@ -326,6 +326,103 @@ def _restore_quarantine_or_fail(build_fd, prepared, quarantine_name, reason):
     )
 
 
+def _is_real_directory_identity(entry, device, inode):
+    return (
+        entry is not None
+        and stat.S_ISDIR(entry.st_mode)
+        and not stat.S_ISLNK(entry.st_mode)
+        and entry.st_dev == device
+        and entry.st_ino == inode
+    )
+
+
+def _recover_staging_identity_mismatch(build_fd, prepared, quarantine_name):
+    reason = "published staging identity mismatch"
+    preserved_state = (
+        f"unexpected final .build/{prepared.final_name}"
+        if quarantine_name is None
+        else (
+            f"unexpected final .build/{prepared.final_name} and "
+            f"old-output quarantine .build/{quarantine_name}"
+        )
+    )
+    try:
+        recovery_name = _unique_name(
+            build_fd,
+            f".{prepared.final_name}.recovery-",
+            create=False,
+        )
+    except OutputDirectoryError as error:
+        raise OutputDirectoryError(
+            f"{reason}; {preserved_state}; publication state was preserved "
+            f"because a recovery name could not be allocated: {error}"
+        ) from error
+    try:
+        _rename_exclusive(
+            prepared.final_name,
+            recovery_name,
+            source_fd=build_fd,
+            destination_fd=build_fd,
+        )
+    except FileExistsError as error:
+        raise OutputDirectoryError(
+            f"{reason}; {preserved_state}; publication state was preserved "
+            f"because recovery destination .build/{recovery_name} already "
+            "exists"
+        ) from error
+    except (OSError, OutputDirectoryError) as error:
+        raise OutputDirectoryError(
+            f"{reason}; {preserved_state}; publication state was preserved "
+            f"because recovery to .build/{recovery_name} failed: {error}"
+        ) from error
+
+    recovery_state = (
+        f"unexpected entry preserved at recovery .build/{recovery_name}"
+    )
+    if quarantine_name is None:
+        raise OutputDirectoryError(
+            f"{reason}; {recovery_state}; final "
+            f".build/{prepared.final_name} is absent"
+        )
+
+    try:
+        _rename_exclusive(
+            quarantine_name,
+            prepared.final_name,
+            source_fd=build_fd,
+            destination_fd=build_fd,
+        )
+    except FileExistsError as error:
+        raise OutputDirectoryError(
+            f"{reason}; {recovery_state}; concurrent final "
+            f".build/{prepared.final_name} and old-output quarantine "
+            f".build/{quarantine_name} were preserved because restoration "
+            "was blocked"
+        ) from error
+    except (OSError, OutputDirectoryError) as error:
+        raise OutputDirectoryError(
+            f"{reason}; {recovery_state}; old-output quarantine "
+            f".build/{quarantine_name} was preserved because restoration "
+            f"failed: {error}"
+        ) from error
+
+    restored = _lstat_at(build_fd, prepared.final_name)
+    if not _is_real_directory_identity(
+        restored,
+        prepared.final_device,
+        prepared.final_inode,
+    ):
+        raise OutputDirectoryError(
+            f"{reason}; {recovery_state}; restoration moved an entry to "
+            f".build/{prepared.final_name}, but it did not match the "
+            "prepared original-output identity; the quarantine name is absent"
+        )
+    raise OutputDirectoryError(
+        f"{reason}; {recovery_state}; original output restored at "
+        f".build/{prepared.final_name}"
+    )
+
+
 def publish_output(root, prepared):
     _validate_prepared(prepared)
     build_fd = _open_build_root(root, create=False)
@@ -386,6 +483,17 @@ def publish_output(root, prepared):
                     "concurrent final prevented exclusive stage publication; "
                     "private staging was preserved"
                 ) from error
+            published = _lstat_at(build_fd, prepared.final_name)
+            if not _is_real_directory_identity(
+                published,
+                prepared.staging_device,
+                prepared.staging_inode,
+            ):
+                _recover_staging_identity_mismatch(
+                    build_fd,
+                    prepared,
+                    quarantine_name,
+                )
         except OutputDirectoryError:
             raise
         except OSError as error:
