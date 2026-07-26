@@ -1,0 +1,17 @@
+{
+  "commit": "d14ab17dd6c743e88d71bb806b9f42fe8a069daf",
+  "repository": "https://github.com/ayooooo123/mediastorm-frontend.git",
+  "schemaVersion": 1,
+  "sources": [
+    {
+      "copiedPath": "Probes/MediaStormAPIProbe/UpstreamApiProbe.swift",
+      "originalPath": "modules/cast-transport/ios/UpstreamApiProbe.swift",
+      "sha256": "7b71a9e3c64895916d1cc77851a7221e879f6bba8e476bef6351aefc3c287a8a"
+    },
+    {
+      "copiedPath": "Probes/MediaStormAPIProbe/BonjourEndpointResolver.swift",
+      "originalPath": "modules/cast-transport/ios-core/Sources/CastTransportCore/BonjourEndpointResolver.swift",
+      "sha256": "10ff1d64de562c6f9a7363c99821d4219511deede88c6ac9aafbfdcf4e73a293"
+    }
+  ]
+}
