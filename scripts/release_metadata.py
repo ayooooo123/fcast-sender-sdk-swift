@@ -1,9 +1,13 @@
 import argparse
+import copy
+import hashlib
 import json
 import os
+import plistlib
 import re
 import secrets
 import stat
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -267,6 +271,92 @@ def validate_provenance(
     _require_exact_value(provenance, expected, "provenance")
 
 
+def augment_provenance(
+    base: dict[str, object],
+    release_tag_commit: str,
+) -> dict[str, object]:
+    """Return the canonical release-asset provenance for an existing tag commit."""
+    _validate_commit(release_tag_commit, "release tag commit")
+    if type(base) is not dict:
+        raise ReleaseMetadataError("base provenance must be a JSON object")
+    if "releaseTagCommit" in base:
+        raise ReleaseMetadataError(
+            "base provenance already contains releaseTagCommit"
+        )
+    _verify_base_provenance_schema(base)
+    augmented = copy.deepcopy(base)
+    augmented["releaseTagCommit"] = release_tag_commit
+    return augmented
+
+
+def verify_provenance(
+    provenance: dict[str, object],
+    *,
+    package_swift: str,
+    source_pin: SourcePin,
+    release_input_commit: str,
+    release_tag_commit: str | None,
+    archive: Path | None,
+) -> None:
+    """Require exact manifest, lock, commit, provenance, and optional ZIP agreement."""
+    _validate_commit(release_input_commit, "release input commit")
+    _validate_source_pin(source_pin)
+    version, checksum = _parse_canonical_package(package_swift)
+    expected = build_provenance(
+        version=version,
+        distribution_commit=release_input_commit,
+        source_pin=source_pin,
+        environment=_approved_environment(),
+        archive_sha256=checksum,
+        binary_target=BINARY_TARGET,
+        product=PACKAGE_PRODUCT,
+        artifact_url=release_url(version),
+        swiftpm_checksum=checksum,
+    )
+    if release_tag_commit is not None:
+        expected = augment_provenance(expected, release_tag_commit)
+    _require_exact_value(provenance, expected, "provenance")
+
+    if archive is not None:
+        archive_path = Path(archive)
+        try:
+            archive_stat = archive_path.lstat()
+        except OSError as error:
+            raise ReleaseMetadataError(
+                f"unable to inspect archive {archive_path}: {error}"
+            ) from error
+        if stat.S_ISLNK(archive_stat.st_mode) or not stat.S_ISREG(
+            archive_stat.st_mode
+        ):
+            raise ReleaseMetadataError(
+                "archive must be a non-symlink regular file"
+            )
+        python_checksum = _sha256_file(archive_path)
+        if python_checksum != checksum:
+            raise ReleaseMetadataError(
+                "archive Python SHA-256 disagrees with Package.swift"
+            )
+        try:
+            completed = subprocess.run(
+                ["swift", "package", "compute-checksum", str(archive_path)],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except (OSError, subprocess.CalledProcessError) as error:
+            detail = getattr(error, "stderr", None) or str(error)
+            raise ReleaseMetadataError(
+                f"unable to compute SwiftPM checksum: {detail}"
+            ) from error
+        swiftpm_checksum = completed.stdout.strip()
+        _validate_sha256(swiftpm_checksum, "SwiftPM checksum")
+        if swiftpm_checksum != checksum:
+            raise ReleaseMetadataError(
+                "archive SwiftPM checksum disagrees with Package.swift"
+            )
+
+
 def serialize_json(payload: object) -> str:
     return (
         json.dumps(
@@ -277,6 +367,67 @@ def serialize_json(payload: object) -> str:
         )
         + "\n"
     )
+
+
+def normalize_xcframework_plist(plist_bytes: bytes) -> bytes:
+    """Return one deterministic encoding with device before simulator."""
+    if type(plist_bytes) is not bytes:
+        raise ReleaseMetadataError("XCFramework Info.plist input must be bytes")
+    try:
+        payload = plistlib.loads(plist_bytes)
+    except (plistlib.InvalidFileException, ValueError, TypeError) as error:
+        raise ReleaseMetadataError(
+            f"XCFramework Info.plist must be a valid property list: {error}"
+        ) from error
+    if type(payload) is not dict:
+        raise ReleaseMetadataError(
+            "XCFramework Info.plist root must be a dictionary"
+        )
+    expected_root_keys = {
+        "AvailableLibraries",
+        "CFBundlePackageType",
+        "XCFrameworkFormatVersion",
+    }
+    if set(payload) != expected_root_keys:
+        raise ReleaseMetadataError(
+            "XCFramework Info.plist contains unknown or missing root keys"
+        )
+    if payload["CFBundlePackageType"] != "XFWK":
+        raise ReleaseMetadataError(
+            "XCFramework CFBundlePackageType must be exactly XFWK"
+        )
+    if payload["XCFrameworkFormatVersion"] != "1.0":
+        raise ReleaseMetadataError(
+            "XCFramework format version must be exactly 1.0"
+        )
+    libraries = payload["AvailableLibraries"]
+    if type(libraries) is not list or len(libraries) != 2:
+        raise ReleaseMetadataError(
+            "AvailableLibraries must contain exactly two entries with "
+            "LibraryIdentifier values"
+        )
+    identifiers = []
+    for index, entry in enumerate(libraries):
+        if type(entry) is not dict:
+            raise ReleaseMetadataError(
+                f"AvailableLibraries[{index}] with LibraryIdentifier "
+                "must be a dictionary"
+            )
+        identifier = entry.get("LibraryIdentifier")
+        if type(identifier) is not str:
+            raise ReleaseMetadataError(
+                f"AvailableLibraries[{index}].LibraryIdentifier "
+                "must be a string"
+            )
+        identifiers.append(identifier)
+    expected_identifiers = {"ios-arm64", "ios-arm64-simulator"}
+    if set(identifiers) != expected_identifiers or len(set(identifiers)) != 2:
+        raise ReleaseMetadataError(
+            "LibraryIdentifier values must be exactly ios-arm64 and "
+            "ios-arm64-simulator without duplicates"
+        )
+    libraries.sort(key=lambda entry: entry["LibraryIdentifier"])
+    return plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=True)
 
 
 def atomic_write_text(path, text):
@@ -477,6 +628,147 @@ def _validate_environment(environment):
             )
 
 
+def _approved_environment():
+    return BuildEnvironment(
+        schema_version=EXPECTED_ENVIRONMENT["schemaVersion"],
+        runner=EXPECTED_ENVIRONMENT["runner"],
+        xcode_version=EXPECTED_ENVIRONMENT["xcodeVersion"],
+        xcode_build_version=EXPECTED_ENVIRONMENT["xcodeBuildVersion"],
+        swift_version=EXPECTED_ENVIRONMENT["swiftVersion"],
+        swift_language_revision=EXPECTED_ENVIRONMENT[
+            "swiftLanguageRevision"
+        ],
+        rust_version=EXPECTED_ENVIRONMENT["rustVersion"],
+        zip_version=EXPECTED_ENVIRONMENT["zipVersion"],
+    )
+
+
+def _parse_canonical_package(package_swift):
+    if type(package_swift) is not str:
+        raise ReleaseMetadataError("Package.swift must be text")
+    url_matches = re.findall(r'^let url = "([^"]+)"$', package_swift, re.M)
+    checksum_matches = re.findall(
+        r'^let checksum = "([^"]*)"$',
+        package_swift,
+        re.M,
+    )
+    if len(url_matches) != 1 or len(checksum_matches) != 1:
+        raise ReleaseMetadataError(
+            "Package.swift must contain one canonical URL and checksum"
+        )
+    url = url_matches[0]
+    checksum = checksum_matches[0]
+    _validate_sha256(checksum, "Package.swift checksum")
+    url_pattern = re.compile(
+        re.escape(RELEASE_REPOSITORY)
+        + r"/releases/download/([^/]+)/"
+        + re.escape(RELEASE_ASSET)
+    )
+    match = url_pattern.fullmatch(url)
+    if match is None:
+        raise ReleaseMetadataError(
+            "Package.swift URL must be the immutable versioned GitHub asset"
+        )
+    version = match.group(1)
+    _validate_version(version)
+    canonical = render_package(version, checksum)
+    if package_swift != canonical:
+        raise ReleaseMetadataError(
+            "Package.swift must exactly equal the canonical rendered manifest"
+        )
+    return version, checksum
+
+
+def _verify_base_provenance_schema(base):
+    if type(base) is not dict:
+        raise ReleaseMetadataError("base provenance must be a JSON object")
+    required = {
+        "schemaVersion",
+        "version",
+        "tag",
+        "distributionInputCommit",
+        "source",
+        "build",
+        "package",
+        "archiveSHA256",
+        "sourcePatched",
+    }
+    unknown = set(base) - required
+    if unknown:
+        raise ReleaseMetadataError(
+            "base provenance contains unknown keys: "
+            + ", ".join(sorted(unknown))
+        )
+    missing = required - set(base)
+    if missing:
+        raise ReleaseMetadataError(
+            "base provenance is missing keys: " + ", ".join(sorted(missing))
+        )
+    if type(base["version"]) is not str:
+        raise ReleaseMetadataError("base provenance version must be text")
+    if type(base["distributionInputCommit"]) is not str:
+        raise ReleaseMetadataError(
+            "base provenance distributionInputCommit must be text"
+        )
+    if type(base["package"]) is not dict:
+        raise ReleaseMetadataError("base provenance package must be an object")
+    package_keys = {
+        "binaryTarget",
+        "product",
+        "assetURL",
+        "swiftPMChecksum",
+    }
+    if set(base["package"]) != package_keys:
+        raise ReleaseMetadataError(
+            "base provenance package contains unknown or missing keys"
+        )
+    version = base["version"]
+    release_input_commit = base["distributionInputCommit"]
+    checksum = base["package"]["swiftPMChecksum"]
+    if type(checksum) is not str:
+        raise ReleaseMetadataError(
+            "base provenance SwiftPM checksum must be text"
+        )
+    expected = build_provenance(
+        version=version,
+        distribution_commit=release_input_commit,
+        source_pin=_approved_source_pin(),
+        environment=_approved_environment(),
+        archive_sha256=checksum,
+        binary_target=BINARY_TARGET,
+        product=PACKAGE_PRODUCT,
+        artifact_url=release_url(version),
+        swiftpm_checksum=checksum,
+    )
+    _require_exact_value(base, expected, "base provenance")
+
+
+def _approved_source_pin():
+    return SourcePin(
+        schema_version=1,
+        repository=EXPECTED_REPOSITORY,
+        tag=EXPECTED_TAG,
+        commit=EXPECTED_COMMIT,
+        rust_toolchain=EXPECTED_RUST_TOOLCHAIN,
+        rust_targets=EXPECTED_RUST_TARGETS,
+        cargo_package=EXPECTED_CARGO_PACKAGE,
+        features=EXPECTED_FEATURES,
+    )
+
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as error:
+        raise ReleaseMetadataError(
+            f"unable to hash archive {path}: {error}"
+        ) from error
+    return digest.hexdigest()
+
+
 def _require_exact_value(actual, expected, path):
     if type(actual) is not type(expected):
         raise ReleaseMetadataError(
@@ -537,7 +829,50 @@ def _build_parser():
     metadata.add_argument("--environment-lock", required=True)
     metadata.add_argument("--source-date-epoch", required=True, type=int)
     metadata.add_argument("--output", required=True)
+
+    provenance = commands.add_parser("render-provenance")
+    provenance.add_argument("--version", required=True)
+    provenance.add_argument("--release-input-commit", required=True)
+    provenance.add_argument("--checksum", required=True)
+    provenance.add_argument("--source-lock", required=True)
+    provenance.add_argument("--environment-lock", required=True)
+    provenance.add_argument("--output", required=True)
+
+    augment = commands.add_parser("augment-provenance")
+    augment.add_argument("--base", required=True)
+    augment.add_argument("--release-tag-commit", required=True)
+    augment.add_argument("--output", required=True)
+
+    verify = commands.add_parser("verify-provenance")
+    verify.add_argument("--provenance", required=True)
+    verify.add_argument("--package", required=True)
+    verify.add_argument("--source-lock", required=True)
+    verify.add_argument("--release-input-commit", required=True)
+    verify.add_argument("--release-tag-commit")
+    verify.add_argument("--archive")
+
+    normalize = commands.add_parser("normalize-xcframework-plist")
+    normalize.add_argument("--plist", required=True)
     return parser
+
+
+def _load_json_object(path, field):
+    input_path = Path(path)
+    try:
+        payload = json.loads(
+            input_path.read_text(encoding="utf-8"),
+            object_pairs_hook=_reject_duplicate_object_keys,
+        )
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        detail = getattr(error, "msg", str(error))
+        raise ReleaseMetadataError(
+            f"{field} must contain valid JSON encoded as UTF-8: {detail}"
+        ) from error
+    except OSError as error:
+        raise ReleaseMetadataError(f"unable to read {field}: {error}") from error
+    if type(payload) is not dict:
+        raise ReleaseMetadataError(f"{field} must be a JSON object")
+    return payload
 
 
 def main(argv=None):
@@ -550,7 +885,7 @@ def main(argv=None):
             source_pin = SourcePin.load(arguments.source_lock)
             environment = BuildEnvironment.load(arguments.environment_lock)
             sys.stdout.write(render_build_inputs(source_pin, environment))
-        else:
+        elif arguments.command == "render-build-metadata":
             source_pin = SourcePin.load(arguments.source_lock)
             environment = BuildEnvironment.load(arguments.environment_lock)
             rendered = render_build_metadata(
@@ -559,6 +894,70 @@ def main(argv=None):
                 arguments.source_date_epoch,
             )
             atomic_write_text(arguments.output, rendered)
+        elif arguments.command == "render-provenance":
+            source_pin = SourcePin.load(arguments.source_lock)
+            environment = BuildEnvironment.load(arguments.environment_lock)
+            payload = build_provenance(
+                version=arguments.version,
+                distribution_commit=arguments.release_input_commit,
+                source_pin=source_pin,
+                environment=environment,
+                archive_sha256=arguments.checksum,
+                binary_target=BINARY_TARGET,
+                product=PACKAGE_PRODUCT,
+                artifact_url=release_url(arguments.version),
+                swiftpm_checksum=arguments.checksum,
+            )
+            atomic_write_text(arguments.output, serialize_json(payload))
+        elif arguments.command == "augment-provenance":
+            base = _load_json_object(arguments.base, "base provenance")
+            payload = augment_provenance(
+                base,
+                arguments.release_tag_commit,
+            )
+            atomic_write_text(arguments.output, serialize_json(payload))
+        elif arguments.command == "verify-provenance":
+            payload = _load_json_object(
+                arguments.provenance,
+                "provenance",
+            )
+            try:
+                package_swift = Path(arguments.package).read_text(
+                    encoding="utf-8"
+                )
+            except (OSError, UnicodeDecodeError) as error:
+                raise ReleaseMetadataError(
+                    f"unable to read Package.swift: {error}"
+                ) from error
+            source_pin = SourcePin.load(arguments.source_lock)
+            verify_provenance(
+                payload,
+                package_swift=package_swift,
+                source_pin=source_pin,
+                release_input_commit=arguments.release_input_commit,
+                release_tag_commit=arguments.release_tag_commit,
+                archive=(
+                    Path(arguments.archive)
+                    if arguments.archive is not None
+                    else None
+                ),
+            )
+        else:
+            plist_path = Path(arguments.plist)
+            try:
+                plist_bytes = plist_path.read_bytes()
+            except OSError as error:
+                raise ReleaseMetadataError(
+                    f"unable to read XCFramework Info.plist: {error}"
+                ) from error
+            normalized = normalize_xcframework_plist(plist_bytes)
+            try:
+                normalized_text = normalized.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise ReleaseMetadataError(
+                    "normalized XCFramework Info.plist must be UTF-8"
+                ) from error
+            atomic_write_text(plist_path, normalized_text)
     except (OSError, SourcePinError, ReleaseMetadataError) as error:
         print(f"release metadata error: {error}", file=sys.stderr)
         return 1

@@ -1,3 +1,5 @@
+import copy
+import plistlib
 import subprocess
 import sys
 import tempfile
@@ -11,6 +13,56 @@ VERIFY_SCRIPT = REPOSITORY_ROOT / "scripts" / "verify-artifact.sh"
 
 
 class BuildScriptTests(unittest.TestCase):
+    def library_entries(self):
+        return [
+            {
+                "BinaryPath": "libfcast_sender_sdk.a",
+                "HeadersPath": "Headers",
+                "LibraryIdentifier": "ios-arm64",
+                "LibraryPath": "libfcast_sender_sdk.a",
+                "SupportedArchitectures": ["arm64"],
+                "SupportedPlatform": "ios",
+            },
+            {
+                "BinaryPath": "libfcast_sender_sdk.a",
+                "HeadersPath": "Headers",
+                "LibraryIdentifier": "ios-arm64-simulator",
+                "LibraryPath": "libfcast_sender_sdk.a",
+                "SupportedArchitectures": ["arm64"],
+                "SupportedPlatform": "ios",
+                "SupportedPlatformVariant": "simulator",
+            },
+        ]
+
+    def plist_payload(self, entries=None):
+        return {
+            "AvailableLibraries": (
+                copy.deepcopy(entries)
+                if entries is not None
+                else self.library_entries()
+            ),
+            "CFBundlePackageType": "XFWK",
+            "XCFrameworkFormatVersion": "1.0",
+        }
+
+    def normalize_plist(self, payload):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "Info.plist"
+            with path.open("wb") as stream:
+                plistlib.dump(payload, stream, sort_keys=True)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPOSITORY_ROOT / "scripts" / "release_metadata.py"),
+                    "normalize-xcframework-plist",
+                    "--plist",
+                    str(path),
+                ],
+                text=True,
+                capture_output=True,
+            )
+            return result, path.read_bytes()
+
     def run_build_with_side_effect_sentinels(self, arguments):
         with tempfile.TemporaryDirectory() as directory:
             fixture = Path(directory)
@@ -178,6 +230,73 @@ class BuildScriptTests(unittest.TestCase):
             "ios-bindings/fcast_sender_sdk.xcframework",
             text,
         )
+
+    def test_opposite_valid_xcframework_plist_orders_normalize_byte_identically(self):
+        entries = self.library_entries()
+        first, first_bytes = self.normalize_plist(self.plist_payload(entries))
+        second, second_bytes = self.normalize_plist(
+            self.plist_payload(list(reversed(entries)))
+        )
+
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(first_bytes, second_bytes)
+        normalized = plistlib.loads(first_bytes)
+        self.assertEqual(
+            [
+                entry["LibraryIdentifier"]
+                for entry in normalized["AvailableLibraries"]
+            ],
+            ["ios-arm64", "ios-arm64-simulator"],
+        )
+
+    def test_xcframework_plist_normalizer_rejects_malformed_identifiers(self):
+        entries = self.library_entries()
+        cases = {
+            "missing": [dict(entries[0]), dict(entries[1])],
+            "duplicate": [dict(entries[0]), dict(entries[0])],
+            "unknown": [dict(entries[0]), dict(entries[1])],
+            "non-string": [dict(entries[0]), dict(entries[1])],
+        }
+        del cases["missing"][1]["LibraryIdentifier"]
+        cases["unknown"][1]["LibraryIdentifier"] = "ios-x86_64-simulator"
+        cases["non-string"][1]["LibraryIdentifier"] = 7
+
+        for name, changed_entries in cases.items():
+            with self.subTest(name=name):
+                result, _ = self.normalize_plist(
+                    self.plist_payload(changed_entries)
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("LibraryIdentifier", result.stderr)
+
+    def test_build_canonicalizes_plist_immediately_after_xcframework_creation(self):
+        text = BUILD_SCRIPT.read_text(encoding="utf-8")
+        create_index = text.index("xcodebuild -create-xcframework")
+        normalize_index = text.index("normalize-xcframework-plist")
+        binding_copy_index = text.index(
+            "cp ios-bindings/uniffi/fcast_sender_sdk.swift"
+        )
+        verify_index = text.index("verify-artifact.sh", binding_copy_index)
+
+        self.assertLess(create_index, normalize_index)
+        self.assertLess(normalize_index, binding_copy_index)
+        self.assertLess(normalize_index, verify_index)
+
+    def test_build_suppresses_bytecode_only_after_sanitizer_validation(self):
+        text = BUILD_SCRIPT.read_text(encoding="utf-8")
+        sanitized_index = text.index(
+            "python3 \"$SCRIPT_DIR/build_boundary.py\" "
+            "check-sanitized-environment"
+        )
+        export_index = text.index("export PYTHONDONTWRITEBYTECODE=1")
+        local_import_index = text.index(
+            "python3 \"$REPOSITORY_ROOT/scripts/release_metadata.py\" "
+            "build-inputs"
+        )
+
+        self.assertLess(sanitized_index, export_index)
+        self.assertLess(export_index, local_import_index)
 
     def test_build_emits_only_the_approved_distribution_outputs(self):
         text = BUILD_SCRIPT.read_text(encoding="utf-8")

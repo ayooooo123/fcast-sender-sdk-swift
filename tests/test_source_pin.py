@@ -1,5 +1,6 @@
 import json
 import tempfile
+import tomllib
 import unittest
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -9,6 +10,7 @@ from scripts.source_pin import SourcePin, SourcePinError
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 CHECKED_IN_LOCK = REPOSITORY_ROOT / "source.lock.json"
+CHECKED_IN_RUST_TOOLCHAIN = REPOSITORY_ROOT / "rust-toolchain.toml"
 
 
 def valid_payload():
@@ -77,6 +79,23 @@ class SourcePinTests(unittest.TestCase):
         self.assertEqual(source_pin.features, ("_ios_defaults",))
         with self.assertRaises(FrozenInstanceError):
             source_pin.tag = "different"
+
+    def test_checked_in_rust_toolchain_exactly_agrees_with_source_lock(self):
+        source_pin = SourcePin.load(CHECKED_IN_LOCK)
+        with CHECKED_IN_RUST_TOOLCHAIN.open("rb") as stream:
+            payload = tomllib.load(stream)
+
+        self.assertEqual(set(payload), {"toolchain"})
+        self.assertEqual(
+            set(payload["toolchain"]),
+            {"channel", "profile", "targets"},
+        )
+        self.assertEqual(payload["toolchain"]["channel"], source_pin.rust_toolchain)
+        self.assertEqual(payload["toolchain"]["profile"], "minimal")
+        self.assertEqual(
+            payload["toolchain"]["targets"],
+            list(source_pin.rust_targets),
+        )
 
     def test_rejects_malformed_json(self):
         with tempfile.TemporaryDirectory() as directory:

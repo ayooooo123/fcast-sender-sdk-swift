@@ -22,6 +22,7 @@ if [[ "${MEDIASTORM_SANITIZED_BUILD:-}" != "1" ]]; then
         --argument "$REQUESTED_OUTPUT"
 fi
 python3 "$SCRIPT_DIR/build_boundary.py" check-sanitized-environment
+export PYTHONDONTWRITEBYTECODE=1
 
 for tool in git rustup cargo xcodebuild lipo swift sw_vers python3 shasum; do
     if ! command -v "$tool" >/dev/null 2>&1; then
@@ -181,6 +182,9 @@ xcodebuild -create-xcframework \
         -library target/aarch64-apple-ios/release/libfcast_sender_sdk.a \
         -headers ios-bindings/uniffi \
         -output "$DISTRIBUTION_OUTPUT/fcast_sender_sdk.xcframework"
+python3 "$REPOSITORY_ROOT/scripts/release_metadata.py" \
+    normalize-xcframework-plist \
+    --plist "$DISTRIBUTION_OUTPUT/fcast_sender_sdk.xcframework/Info.plist"
 
 cp ios-bindings/uniffi/fcast_sender_sdk.swift \
     "$DISTRIBUTION_OUTPUT/FCastSenderSDK.swift"
