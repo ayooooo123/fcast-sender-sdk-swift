@@ -107,6 +107,49 @@ jobs:
 
           ./scripts/build-ios.sh --output .build/ci-repro-1
           ./scripts/verify-artifact.sh .build/ci-repro-1
+          python3 - <<'PY'
+          import hashlib
+          from pathlib import Path
+
+          def archive_members(path):
+              data = path.read_bytes()
+              if not data.startswith(b"!<arch>\n"):
+                  raise SystemExit(f"not an ar archive: {path}")
+              offset = 8
+              while offset < len(data):
+                  header = data[offset:offset + 60]
+                  if len(header) != 60 or header[58:60] != b"`\n":
+                      raise SystemExit(f"invalid ar header at {offset}: {path}")
+                  raw_name = header[:16].decode("ascii").rstrip()
+                  size = int(header[48:58].decode("ascii").strip())
+                  payload = data[offset + 60:offset + 60 + size]
+                  if raw_name.startswith("#1/"):
+                      name_length = int(raw_name[3:])
+                      name = payload[:name_length].decode("utf-8")
+                      payload = payload[name_length:]
+                  else:
+                      name = raw_name.removesuffix("/")
+                  yield name, payload
+                  offset += 60 + size
+                  if offset % 2:
+                      offset += 1
+              if offset != len(data):
+                  raise SystemExit(f"invalid ar archive length: {path}")
+
+          root = Path(".build/ci-repro-1/fcast_sender_sdk.xcframework")
+          for identifier in ("ios-arm64", "ios-arm64-simulator"):
+              archive = root / identifier / "libfcast_sender_sdk.a"
+              print("FCast ar diagnostic", identifier, archive.stat().st_size)
+              for name, payload in archive_members(archive):
+                  print(
+                      "FCast ar member",
+                      identifier,
+                      hashlib.sha256(payload).hexdigest(),
+                      len(payload),
+                      name,
+                  )
+          raise SystemExit("intentional diagnostic stop after build 1")
+          PY
           python3 scripts/archive.py --source .build/ci-repro-1/fcast_sender_sdk.xcframework --output .build/ci-repro-1.zip --source-epoch 1784900561
 
           ./scripts/build-ios.sh --output .build/ci-repro-2
