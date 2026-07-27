@@ -1,0 +1,32 @@
+{
+  "archiveSHA256": "f07a79b9d0b7b9a29127bf44b170bdaef699d600d0056b6013d8db8b69ed95cc",
+  "build": {
+    "runner": "macos-26",
+    "rustTargets": [
+      "aarch64-apple-ios",
+      "aarch64-apple-ios-sim"
+    ],
+    "rustVersion": "1.96.1",
+    "swiftLanguageRevision": "swiftlang-6.3.3.1.3",
+    "swiftVersion": "6.3.3",
+    "xcodeBuildVersion": "17F113",
+    "xcodeVersion": "26.6",
+    "zipVersion": "3.0"
+  },
+  "distributionInputCommit": "97c20655f260b46bc7b9868658eadf752e89c3bb",
+  "package": {
+    "assetURL": "https://github.com/ayooooo123/fcast-sender-sdk-swift/releases/download/0.0.8-mediastorm.1/fcast_sender_sdk.xcframework.zip",
+    "binaryTarget": "fcast_sender_sdkFFI",
+    "product": "FCastSenderSDK",
+    "swiftPMChecksum": "f07a79b9d0b7b9a29127bf44b170bdaef699d600d0056b6013d8db8b69ed95cc"
+  },
+  "schemaVersion": 1,
+  "source": {
+    "commit": "ce3c44c44b4057d3ba050696d9d0baa3e72b46f8",
+    "repository": "https://gitlab.futo.org/videostreaming/fcast.git",
+    "tag": "sender-sdk-v0.5.0"
+  },
+  "sourcePatched": false,
+  "tag": "0.0.8-mediastorm.1",
+  "version": "0.0.8-mediastorm.1"
+}
