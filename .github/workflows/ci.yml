@@ -111,6 +111,32 @@ jobs:
 
           ./scripts/build-ios.sh --output .build/ci-repro-2
           ./scripts/verify-artifact.sh .build/ci-repro-2
+          python3 - <<'PY'
+          import hashlib
+          from pathlib import Path
+
+          for build_name in ("ci-repro-1", "ci-repro-2"):
+              root = (
+                  Path(".build")
+                  / build_name
+                  / "fcast_sender_sdk.xcframework"
+              )
+              for path in sorted(root.rglob("*")):
+                  if path.is_file():
+                      digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                      print(
+                          "FCast diagnostic",
+                          build_name,
+                          digest,
+                          path.stat().st_size,
+                          path.relative_to(root),
+                      )
+              print(
+                  "FCast diagnostic Info.plist",
+                  build_name,
+                  (root / "Info.plist").read_text(encoding="utf-8"),
+              )
+          PY
           python3 scripts/archive.py --source .build/ci-repro-2/fcast_sender_sdk.xcframework --output .build/ci-repro-2.zip --source-epoch 1784900561
 
           cmp .build/ci-repro-1.zip .build/ci-repro-2.zip
