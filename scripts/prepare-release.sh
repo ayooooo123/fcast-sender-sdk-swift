@@ -24,15 +24,35 @@ if [[ ! "$RELEASE_INPUT_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
 fi
 
 cd "$REPOSITORY_ROOT"
+BUILD_ROOT="$REPOSITORY_ROOT/.build"
+require_safe_build_root() {
+    if [[ -L "$BUILD_ROOT" ]] ||
+        { [[ -e "$BUILD_ROOT" ]] && [[ ! -d "$BUILD_ROOT" ]]; }; then
+        echo "repo .build must be a real non-symlink directory" >&2
+        exit 73
+    fi
+    if [[ -d "$BUILD_ROOT" ]]; then
+        local resolved_build_root
+        resolved_build_root="$(cd "$BUILD_ROOT" && pwd -P)"
+        if [[ "$resolved_build_root" != "$BUILD_ROOT" ]]; then
+            echo "repo .build must resolve to its in-repository path" >&2
+            exit 73
+        fi
+    fi
+}
+require_safe_build_root
+
 ACTUAL_HEAD="$(git rev-parse HEAD)"
 if [[ "$ACTUAL_HEAD" != "$RELEASE_INPUT_COMMIT" ]]; then
     echo "release input commit must equal HEAD" >&2
     exit 65
 fi
-if [[ -n "$(git status --short --untracked-files=no)" ]]; then
-    echo "release preparation requires a clean tracked tree" >&2
+if [[ -n "$(git status --short --untracked-files=all)" ]]; then
+    echo "release preparation requires a fully clean checkout" >&2
     exit 65
 fi
+INITIAL_REPOSITORY_REFS="$(git show-ref --head)"
+INITIAL_REPOSITORY_INDEX="$(git ls-files --stage)"
 if git show-ref --verify --quiet "refs/tags/$RELEASE_VERSION"; then
     echo "local release tag already exists: $RELEASE_VERSION" >&2
     exit 65
@@ -52,22 +72,35 @@ python3 -m unittest discover -s tests -v
 for shell_script in "$SCRIPT_DIR"/*.sh; do
     bash -n "$shell_script"
 done
+if [[ -n "$(git status --short --untracked-files=all)" ]]; then
+    echo "release checkout changed while running tests" >&2
+    exit 65
+fi
+require_safe_build_root
+for release_child in release-build-1 release-build-2 release; do
+    release_path="$BUILD_ROOT/$release_child"
+    if [[ -L "$release_path" ]] ||
+        { [[ -e "$release_path" ]] && [[ ! -d "$release_path" ]]; }; then
+        echo "unsafe release layout: .build/$release_child must be a real non-symlink directory" >&2
+        exit 73
+    fi
+done
+python3 "$SCRIPT_DIR/output_directory.py" validate-release-layout \
+    --root "$REPOSITORY_ROOT"
+
+RELEASE_TEMP="$(mktemp -d "${TMPDIR:-/tmp}/fcast-ios-release.XXXXXX")"
+cleanup() {
+    rm -rf -- "$RELEASE_TEMP"
+}
+trap cleanup EXIT
 
 BUILD_ONE="$REPOSITORY_ROOT/.build/release-build-1"
 BUILD_TWO="$REPOSITORY_ROOT/.build/release-build-2"
-ARCHIVE_ONE="$REPOSITORY_ROOT/.build/release-build-1.zip"
-ARCHIVE_TWO="$REPOSITORY_ROOT/.build/release-build-2.zip"
+ARCHIVE_ONE="$RELEASE_TEMP/release-build-1.zip"
+ARCHIVE_TWO="$RELEASE_TEMP/release-build-2.zip"
 RELEASE_DIRECTORY="$REPOSITORY_ROOT/.build/release"
 FINAL_ARCHIVE="$RELEASE_DIRECTORY/fcast_sender_sdk.xcframework.zip"
 BASE_ASSET_PROVENANCE="$RELEASE_DIRECTORY/provenance.json"
-
-rm -rf -- \
-    "$BUILD_ONE" \
-    "$BUILD_TWO" \
-    "$ARCHIVE_ONE" \
-    "$ARCHIVE_TWO" \
-    "$RELEASE_DIRECTORY"
-mkdir -p "$REPOSITORY_ROOT/.build" "$RELEASE_DIRECTORY"
 
 ./scripts/build-ios.sh --output .build/release-build-1
 ./scripts/build-ios.sh --output .build/release-build-2
@@ -132,8 +165,10 @@ python3 scripts/release_metadata.py render-provenance \
     --environment-lock "$REPOSITORY_ROOT/build-environment.lock.json" \
     --output "$REPOSITORY_ROOT/provenance.json"
 
-cp "$ARCHIVE_ONE" "$FINAL_ARCHIVE"
-cp "$REPOSITORY_ROOT/provenance.json" "$BASE_ASSET_PROVENANCE"
+python3 "$SCRIPT_DIR/output_directory.py" install-release-assets \
+    --root "$REPOSITORY_ROOT" \
+    --archive "$ARCHIVE_ONE" \
+    --provenance "$REPOSITORY_ROOT/provenance.json"
 python3 scripts/release_metadata.py verify-provenance \
     --provenance "$BASE_ASSET_PROVENANCE" \
     --package "$REPOSITORY_ROOT/Package.swift" \
@@ -141,11 +176,7 @@ python3 scripts/release_metadata.py verify-provenance \
     --release-input-commit "$RELEASE_INPUT_COMMIT" \
     --archive "$FINAL_ARCHIVE"
 
-FINAL_VERIFY_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/fcast-final-archive.XXXXXX")"
-cleanup() {
-    rm -rf -- "$FINAL_VERIFY_ROOT"
-}
-trap cleanup EXIT
+FINAL_VERIFY_ROOT="$RELEASE_TEMP/final-archive"
 mkdir -p "$FINAL_VERIFY_ROOT/artifact"
 unzip -q "$FINAL_ARCHIVE" -d "$FINAL_VERIFY_ROOT/artifact"
 cp \
@@ -154,6 +185,24 @@ cp \
     "$FINAL_VERIFY_ROOT/artifact/"
 ./scripts/verify-artifact.sh "$FINAL_VERIFY_ROOT/artifact"
 ./scripts/verify-local-package.sh "$FINAL_VERIFY_ROOT/artifact"
+
+if [[ "$(git show-ref --head)" != "$INITIAL_REPOSITORY_REFS" ]] ||
+    [[ "$(git ls-files --stage)" != "$INITIAL_REPOSITORY_INDEX" ]]; then
+    echo "repository metadata changed during dry run" >&2
+    exit 74
+fi
+UNEXPECTED_STATUS="$(
+    git status --short --untracked-files=all -- \
+        . \
+        ':(exclude)Package.swift' \
+        ':(exclude)provenance.json' \
+        ':(exclude)Sources/FCastSenderSDK/FCastSenderSDK.swift'
+)"
+if [[ -n "$UNEXPECTED_STATUS" ]]; then
+    echo "unexpected checkout changes after release preparation" >&2
+    printf '%s\n' "$UNEXPECTED_STATUS" >&2
+    exit 65
+fi
 
 printf '%s\n' "candidate file status:"
 git status --short --untracked-files=all -- \

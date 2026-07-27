@@ -554,6 +554,141 @@ def discard_output(root, prepared):
         os.close(build_fd)
 
 
+def validate_release_layout(root):
+    build_fd = _open_build_root(root, create=True)
+    try:
+        for name in ("release-build-1", "release-build-2", "release"):
+            entry = _lstat_at(build_fd, name)
+            if entry is None:
+                continue
+            if stat.S_ISLNK(entry.st_mode) or not stat.S_ISDIR(entry.st_mode):
+                raise OutputDirectoryError(
+                    "unsafe release layout: "
+                    f".build/{name} must be a real non-symlink directory"
+                )
+        os.fsync(build_fd)
+    except OSError as error:
+        raise OutputDirectoryError(
+            f"unable to validate release layout safely: {error}"
+        ) from error
+    finally:
+        os.close(build_fd)
+
+
+def _copy_regular_file_at(source, directory_fd, destination):
+    source_path = Path(source)
+    try:
+        source_stat = os.stat(source_path, follow_symlinks=False)
+    except OSError as error:
+        raise OutputDirectoryError(
+            f"unable to inspect release asset source {source_path}: {error}"
+        ) from error
+    if stat.S_ISLNK(source_stat.st_mode) or not stat.S_ISREG(source_stat.st_mode):
+        raise OutputDirectoryError(
+            f"release asset source must be a non-symlink regular file: {source_path}"
+        )
+
+    source_fd = None
+    destination_fd = None
+    destination_created = False
+    try:
+        source_fd = os.open(
+            source_path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened_stat = os.fstat(source_fd)
+        if (
+            not stat.S_ISREG(opened_stat.st_mode)
+            or opened_stat.st_dev != source_stat.st_dev
+            or opened_stat.st_ino != source_stat.st_ino
+        ):
+            raise OutputDirectoryError(
+                f"release asset source changed while opening: {source_path}"
+            )
+        destination_fd = os.open(
+            destination,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=directory_fd,
+        )
+        destination_created = True
+        while True:
+            chunk = os.read(source_fd, 1024 * 1024)
+            if not chunk:
+                break
+            offset = 0
+            while offset < len(chunk):
+                offset += os.write(destination_fd, chunk[offset:])
+        os.fchmod(destination_fd, 0o644)
+        os.fsync(destination_fd)
+    except OutputDirectoryError:
+        raise
+    except OSError as error:
+        raise OutputDirectoryError(
+            f"unable to install release asset {destination}: {error}"
+        ) from error
+    finally:
+        if destination_fd is not None:
+            os.close(destination_fd)
+        if source_fd is not None:
+            os.close(source_fd)
+        if destination_created:
+            try:
+                entry = _lstat_at(directory_fd, destination)
+                if entry is not None and not stat.S_ISREG(entry.st_mode):
+                    os.unlink(destination, dir_fd=directory_fd)
+            except (OSError, OutputDirectoryError):
+                pass
+
+
+def install_release_assets(root, archive, provenance):
+    prepared = prepare_output(root, ".build/release")
+    try:
+        build_fd = _open_build_root(root, create=False)
+        try:
+            _require_same_directory(build_fd, prepared)
+            _require_staging(build_fd, prepared)
+            staging_fd = os.open(
+                prepared.staging_name,
+                _directory_flags(),
+                dir_fd=build_fd,
+            )
+            try:
+                staging_stat = os.fstat(staging_fd)
+                if (
+                    staging_stat.st_dev != prepared.staging_device
+                    or staging_stat.st_ino != prepared.staging_inode
+                ):
+                    raise OutputDirectoryError(
+                        "private release staging directory changed while opening"
+                    )
+                _copy_regular_file_at(
+                    archive,
+                    staging_fd,
+                    "fcast_sender_sdk.xcframework.zip",
+                )
+                _copy_regular_file_at(
+                    provenance,
+                    staging_fd,
+                    "provenance.json",
+                )
+                os.fsync(staging_fd)
+            finally:
+                os.close(staging_fd)
+        finally:
+            os.close(build_fd)
+        return publish_output(root, prepared)
+    except Exception:
+        try:
+            discard_output(root, prepared)
+        except (OSError, OutputDirectoryError):
+            pass
+        raise
+
+
 def _prepared_from_args(arguments):
     return PreparedOutput(
         final_name=arguments.final_name,
@@ -588,6 +723,12 @@ def _build_parser():
         command = commands.add_parser(name)
         command.add_argument("--root", required=True)
         _add_token_arguments(command)
+    release_layout = commands.add_parser("validate-release-layout")
+    release_layout.add_argument("--root", required=True)
+    release_assets = commands.add_parser("install-release-assets")
+    release_assets.add_argument("--root", required=True)
+    release_assets.add_argument("--archive", required=True)
+    release_assets.add_argument("--provenance", required=True)
     return parser
 
 
@@ -608,8 +749,22 @@ def main(argv=None):
                     f"{warning}",
                     file=sys.stderr,
                 )
-        else:
+        elif arguments.command == "discard":
             discard_output(arguments.root, _prepared_from_args(arguments))
+        elif arguments.command == "validate-release-layout":
+            validate_release_layout(arguments.root)
+        else:
+            result = install_release_assets(
+                arguments.root,
+                arguments.archive,
+                arguments.provenance,
+            )
+            for warning in result.warnings:
+                print(
+                    "output directory warning: release assets committed: "
+                    f"{warning}",
+                    file=sys.stderr,
+                )
     except OutputDirectoryError as error:
         print(f"output directory error: {error}", file=sys.stderr)
         return 1

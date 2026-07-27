@@ -31,6 +31,110 @@ class OutputDirectorySafetyTests(unittest.TestCase):
             discard_output,
         )
 
+    def test_release_asset_installer_is_fd_relative_and_rejects_symlink_target(self):
+        module = self.load_module_object()
+        installer = getattr(module, "install_release_assets", None)
+        self.assertIsNotNone(
+            installer,
+            "fd-relative release asset installer is missing",
+        )
+        if installer is None:
+            return
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            root = fixture / "repository"
+            build = root / ".build"
+            outside = fixture / "outside"
+            build.mkdir(parents=True)
+            outside.mkdir()
+            sentinel = outside / "sentinel"
+            sentinel.write_text("preserve", encoding="utf-8")
+            (build / "release").symlink_to(outside, target_is_directory=True)
+            archive = fixture / "archive.zip"
+            provenance = fixture / "provenance.json"
+            archive.write_bytes(b"archive")
+            provenance.write_text("{}\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                module.OutputDirectoryError,
+                "symlink",
+            ):
+                installer(root, archive, provenance)
+
+            self.assertTrue((build / "release").is_symlink())
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve")
+
+    def test_fd_relative_release_layout_validator_preserves_unsafe_children(self):
+        module = self.load_module_object()
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            root = fixture / "repository"
+            build = root / ".build"
+            outside = fixture / "outside"
+            build.mkdir(parents=True)
+            outside.mkdir()
+            sentinel = outside / "sentinel"
+            sentinel.write_text("preserve", encoding="utf-8")
+            (build / "release-build-1").symlink_to(
+                outside,
+                target_is_directory=True,
+            )
+
+            with self.assertRaisesRegex(
+                module.OutputDirectoryError,
+                "unsafe release layout.*symlink",
+            ):
+                module.validate_release_layout(root)
+
+            self.assertTrue((build / "release-build-1").is_symlink())
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve")
+
+    def test_release_asset_installer_replaces_only_real_release_directory(self):
+        module = self.load_module_object()
+        installer = getattr(module, "install_release_assets", None)
+        self.assertIsNotNone(
+            installer,
+            "fd-relative release asset installer is missing",
+        )
+        if installer is None:
+            return
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            root = fixture / "repository"
+            build = root / ".build"
+            release = build / "release"
+            sibling = build / "sibling"
+            release.mkdir(parents=True)
+            sibling.mkdir()
+            (release / "old").write_text("old", encoding="utf-8")
+            sibling_marker = sibling / "marker"
+            sibling_marker.write_text("preserve", encoding="utf-8")
+            archive = fixture / "archive.zip"
+            provenance = fixture / "provenance.json"
+            archive.write_bytes(b"candidate archive")
+            provenance.write_text('{"candidate":true}\n', encoding="utf-8")
+
+            installer(root, archive, provenance)
+
+            self.assertEqual(
+                (release / "fcast_sender_sdk.xcframework.zip").read_bytes(),
+                b"candidate archive",
+            )
+            self.assertEqual(
+                (release / "provenance.json").read_text(encoding="utf-8"),
+                '{"candidate":true}\n',
+            )
+            self.assertEqual(
+                sorted(path.name for path in release.iterdir()),
+                ["fcast_sender_sdk.xcframework.zip", "provenance.json"],
+            )
+            self.assertEqual(
+                sibling_marker.read_text(encoding="utf-8"),
+                "preserve",
+            )
+
     def test_rejects_symlink_alias_without_mutating_its_sibling_target(self):
         Error, prepare, _, _ = self.load_module()
         with tempfile.TemporaryDirectory() as directory:
