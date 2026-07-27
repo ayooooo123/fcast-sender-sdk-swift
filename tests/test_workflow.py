@@ -18,7 +18,7 @@ CANONICAL_WORKFLOW_SHA256 = (
 )
 PACKAGE_VERSION = "0.0.8-mediastorm.1"
 PACKAGE_CHECKSUM = (
-    "1b55d676f8999aae0427bbe221a91d3992747aba903038bb4618bf390a75d01a"
+    "f07a79b9d0b7b9a29127bf44b170bdaef699d600d0056b6013d8db8b69ed95cc"
 )
 EXPECTED_STEP_NAMES = [
     "Check out event commit",
@@ -699,7 +699,7 @@ class WorkflowPolicyTests(unittest.TestCase):
         assert_validation_commands(self, workflow_text())
 
     def test_rebuilt_archive_must_match_declared_package_checksum(self):
-        archive_checksum = "1b55d676f8999aae0427bbe221a91d3992747aba903038bb4618bf390a75d01a"
+        archive_checksum = "f07a79b9d0b7b9a29127bf44b170bdaef699d600d0056b6013d8db8b69ed95cc"
         accepted = run_declared_checksum_comparison(
             workflow_text(),
             archive_checksum,

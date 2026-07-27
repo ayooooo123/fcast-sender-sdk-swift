@@ -24,7 +24,7 @@ fi
 python3 "$SCRIPT_DIR/build_boundary.py" check-sanitized-environment
 export PYTHONDONTWRITEBYTECODE=1
 
-for tool in git rustup cargo xcodebuild lipo swift sw_vers python3 shasum; do
+for tool in git rustup cargo xcodebuild xcode-select lipo swift sw_vers python3 shasum; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "required build tool is unavailable: $tool" >&2
         exit 69
@@ -85,6 +85,10 @@ if [[ "$ZIP_OUTPUT" != *"This is Zip $EXPECTED_ZIP_VERSION "* ]]; then
     exit 65
 fi
 
+DEVELOPER_ROOT="$(xcode-select -p)"
+python3 "$SCRIPT_DIR/build_boundary.py" \
+    check-developer-root --path "$DEVELOPER_ROOT"
+
 BUILD_TEMP="$(mktemp -d "${TMPDIR:-/tmp}/fcast-ios-distribution.XXXXXX")"
 OUTPUT_PREPARED=0
 cleanup() {
@@ -98,7 +102,7 @@ trap cleanup EXIT
 BUILD_TEMP="$(cd "$BUILD_TEMP" && pwd -P)"
 CARGO_HOME="$BUILD_TEMP/cargo-home"
 CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=$BUILD_TEMP=/fcast-build"
-CFLAGS="-ffile-prefix-map=$BUILD_TEMP=/fcast-build -fdebug-prefix-map=$BUILD_TEMP=/fcast-build"
+CFLAGS="-ffile-prefix-map=$BUILD_TEMP=/fcast-build -fdebug-prefix-map=$BUILD_TEMP=/fcast-build -ffile-prefix-map=$DEVELOPER_ROOT=/xcode -fdebug-prefix-map=$DEVELOPER_ROOT=/xcode"
 export CARGO_HOME
 export CARGO_ENCODED_RUSTFLAGS
 export CFLAGS

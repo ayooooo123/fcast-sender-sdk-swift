@@ -1192,7 +1192,9 @@ class AmbientBuildEnvironmentTests(unittest.TestCase):
         )
         native_remap = text.index(
             'CFLAGS="-ffile-prefix-map=$BUILD_TEMP=/fcast-build '
-            '-fdebug-prefix-map=$BUILD_TEMP=/fcast-build"'
+            '-fdebug-prefix-map=$BUILD_TEMP=/fcast-build '
+            '-ffile-prefix-map=$DEVELOPER_ROOT=/xcode '
+            '-fdebug-prefix-map=$DEVELOPER_ROOT=/xcode"'
         )
         first_cargo = text.index('cargo "+$RUST_TOOLCHAIN" test')
 
@@ -1203,6 +1205,158 @@ class AmbientBuildEnvironmentTests(unittest.TestCase):
         self.assertLess(remap, first_cargo)
         self.assertIn("export CARGO_ENCODED_RUSTFLAGS", text)
         self.assertIn("export CFLAGS", text)
+
+    def test_developer_root_validator_requires_absolute_canonical_directory(self):
+        import scripts.build_boundary as build_boundary
+
+        validator = getattr(
+            build_boundary,
+            "validate_developer_root",
+            None,
+        )
+        self.assertIsNotNone(
+            validator,
+            "developer-root validator is missing",
+        )
+        if validator is None:
+            return
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory).resolve()
+            canonical = fixture / "Xcode.app" / "Contents" / "Developer"
+            canonical.mkdir(parents=True)
+            alias = fixture / "Xcode-alias"
+            alias.symlink_to(canonical, target_is_directory=True)
+
+            self.assertEqual(validator(str(canonical)), str(canonical))
+            for invalid in (
+                "Xcode.app/Contents/Developer",
+                str(alias),
+                f"{canonical}\nspoof",
+                f"{canonical}\tspoof",
+                str(fixture / "missing"),
+            ):
+                with self.subTest(invalid=repr(invalid)):
+                    with self.assertRaises(build_boundary.BuildBoundaryError):
+                        validator(invalid)
+
+    def test_build_captures_validated_developer_root_after_preflight(self):
+        root = Path(__file__).resolve().parents[1]
+        text = (root / "scripts" / "build-ios.sh").read_text(encoding="utf-8")
+        sanitizer = text.index("check-sanitized-environment")
+        tool_preflight = text.index("for tool in ")
+        developer_capture = text.index(
+            'DEVELOPER_ROOT="$(xcode-select -p)"'
+        )
+        developer_validation = text.index(
+            "check-developer-root --path \"$DEVELOPER_ROOT\""
+        )
+        build_temp = text.index('BUILD_TEMP="$(mktemp -d ')
+
+        self.assertRegex(
+            text,
+            r"for tool in [^\n]*\bxcode-select\b[^\n]*; do",
+        )
+        self.assertLess(sanitizer, tool_preflight)
+        self.assertLess(tool_preflight, developer_capture)
+        self.assertLess(developer_capture, developer_validation)
+        self.assertLess(developer_validation, build_temp)
+        self.assertNotIn("DEVELOPER_DIR=", text)
+
+    def test_build_remaps_native_developer_root_to_canonical_xcode_path(self):
+        root = Path(__file__).resolve().parents[1]
+        text = (root / "scripts" / "build-ios.sh").read_text(encoding="utf-8")
+        expected = (
+            'CFLAGS="-ffile-prefix-map=$BUILD_TEMP=/fcast-build '
+            '-fdebug-prefix-map=$BUILD_TEMP=/fcast-build '
+            '-ffile-prefix-map=$DEVELOPER_ROOT=/xcode '
+            '-fdebug-prefix-map=$DEVELOPER_ROOT=/xcode"'
+        )
+
+        self.assertIn(expected, text)
+        self.assertLess(text.index(expected), text.index('export CFLAGS'))
+
+    def test_native_object_remaps_alternate_developer_root_spellings(self):
+        clang = subprocess.run(
+            ["xcrun", "--find", "clang"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if clang.returncode != 0:
+            self.skipTest("Apple clang is unavailable")
+        compiler = clang.stdout.strip()
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory).resolve()
+            source = fixture / "source.c"
+            source.write_text(
+                '#include "developer-path.h"\n'
+                "int developer_path_length(void) {\n"
+                "    return (int)developer_path[0];\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            roots = (
+                fixture / "Xcode.app" / "Contents" / "Developer",
+                fixture / "Xcode_26.6.app" / "Contents" / "Developer",
+            )
+            for developer_root in roots:
+                include = developer_root / "SDK" / "usr" / "include"
+                include.mkdir(parents=True)
+                (include / "developer-path.h").write_text(
+                    "static const char developer_path[] = __FILE__;\n",
+                    encoding="utf-8",
+                )
+
+            def compile_object(developer_root, output, *, remap):
+                arguments = [
+                    compiler,
+                    "-g",
+                    "-c",
+                    str(source),
+                    "-I",
+                    str(developer_root / "SDK" / "usr" / "include"),
+                    "-o",
+                    str(output),
+                ]
+                if remap:
+                    arguments.extend(
+                        [
+                            f"-ffile-prefix-map={developer_root}=/xcode",
+                            f"-fdebug-prefix-map={developer_root}=/xcode",
+                        ]
+                    )
+                result = subprocess.run(
+                    arguments,
+                    cwd=fixture,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+            raw_objects = (fixture / "raw-a.o", fixture / "raw-b.o")
+            mapped_objects = (
+                fixture / "mapped-a.o",
+                fixture / "mapped-b.o",
+            )
+            for developer_root, raw, mapped in zip(
+                roots,
+                raw_objects,
+                mapped_objects,
+            ):
+                compile_object(developer_root, raw, remap=False)
+                compile_object(developer_root, mapped, remap=True)
+
+            self.assertNotEqual(
+                raw_objects[0].read_bytes(),
+                raw_objects[1].read_bytes(),
+            )
+            self.assertEqual(
+                mapped_objects[0].read_bytes(),
+                mapped_objects[1].read_bytes(),
+            )
 
 
 if __name__ == "__main__":

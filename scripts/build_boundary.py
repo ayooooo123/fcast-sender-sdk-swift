@@ -86,6 +86,20 @@ class BuildBoundaryError(ValueError):
     """Raised when ambient state could alter compiler output."""
 
 
+def validate_developer_root(value):
+    if not isinstance(value, str) or not value:
+        raise BuildBoundaryError("developer root must be a nonempty path")
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise BuildBoundaryError("developer root contains a control character")
+    if not os.path.isabs(value):
+        raise BuildBoundaryError("developer root must be absolute")
+    if os.path.realpath(value) != value:
+        raise BuildBoundaryError("developer root must be canonical")
+    if not os.path.isdir(value):
+        raise BuildBoundaryError("developer root must be an existing directory")
+    return value
+
+
 def validate_ambient_environment(environment):
     for name in sorted(environment):
         uppercase = name.upper()
@@ -161,6 +175,7 @@ def main(argv=None):
         "command",
         choices=(
             "check-environment",
+            "check-developer-root",
             "check-sanitized-environment",
             "re-exec",
             "sanitized-environment",
@@ -168,10 +183,13 @@ def main(argv=None):
     )
     parser.add_argument("--script")
     parser.add_argument("--argument")
+    parser.add_argument("--path")
     arguments = parser.parse_args(argv)
     try:
         if arguments.command == "check-environment":
             validate_ambient_environment(os.environ)
+        elif arguments.command == "check-developer-root":
+            validate_developer_root(arguments.path)
         elif arguments.command == "check-sanitized-environment":
             validate_sanitized_environment(os.environ)
         elif arguments.command == "sanitized-environment":
