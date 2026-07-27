@@ -141,11 +141,25 @@ jobs:
               archive = root / identifier / "libfcast_sender_sdk.a"
               print("FCast ar diagnostic", identifier, archive.stat().st_size)
               member_manifest = hashlib.sha256()
-              for name, payload in archive_members(archive):
+              object_manifest = hashlib.sha256()
+              for member_index, (name, payload) in enumerate(
+                  archive_members(archive)
+              ):
                   payload_digest = hashlib.sha256(payload).hexdigest()
-                  member_manifest.update(
+                  record = (
                       f"{name}\0{len(payload)}\0{payload_digest}\n".encode()
                   )
+                  member_manifest.update(record)
+                  if member_index == 0:
+                      print(
+                          "FCast ar index",
+                          identifier,
+                          payload_digest,
+                          len(payload),
+                          repr(name),
+                      )
+                  else:
+                      object_manifest.update(record)
                   print(
                       "FCast ar member",
                       identifier,
@@ -157,6 +171,11 @@ jobs:
                   "FCast ar aggregate",
                   identifier,
                   member_manifest.hexdigest(),
+              )
+              print(
+                  "FCast ar object aggregate",
+                  identifier,
+                  object_manifest.hexdigest(),
               )
           raise SystemExit("intentional diagnostic stop after build 1")
           PY

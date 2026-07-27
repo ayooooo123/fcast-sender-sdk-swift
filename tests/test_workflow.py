@@ -14,7 +14,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml"
 CHECKOUT_SHA = "11bd71901bbe5b1630ceea73d27597364c9af683"
 CANONICAL_WORKFLOW_SHA256 = (
-    "b006afc10618b8cc5002adbe01ad43b7a2daf81487507b7eddb2e88bc0258a68"
+    "6b18fb30023b42fd9d9d96f42b8b94db9e6ddbc4a7aa7ad80264c38b9d7baf77"
 )
 PACKAGE_VERSION = "0.0.8-mediastorm.1"
 PACKAGE_CHECKSUM = (
